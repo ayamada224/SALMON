@@ -28,7 +28,7 @@ module control_ms_raman
   real(8),allocatable :: Rion_m_next(:,:,:),velocity_m_next(:,:,:)
   character(1024) :: dir_ion_trj
 contains
-subroutine init_ms_raman
+subroutine init_raman_maxwell_ms
   use salmon_global
   use Global_Variables
   use opt_variables
@@ -153,7 +153,7 @@ subroutine init_ms_raman
   write(*,*) "Reading error of trajectory file for Raman mode"
   stop
   
-end subroutine init_ms_raman   
+end subroutine init_raman_maxwell_ms
 
 subroutine raman_maxwell_ms
   use Global_Variables

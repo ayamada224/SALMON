@@ -99,7 +99,7 @@ contains
 ! initialize for optimization.
     call opt_vars_initialize_p2
 
-    if(use_ehrenfest_md=='y' .or. use_adiabatic_md=='y') then
+    if(use_ehrenfest_md=='y' .or. use_adiabatic_md=='y' .or. theory=='CMD') then
        call init_md
     endif
 
@@ -123,7 +123,9 @@ contains
     use misc_routines
     use timer
     use inputoutput, only: au_length_aa
-    use control_ms_raman, only: init_ms_raman
+    use control_sc_cmd,   only: init_cmd_sc
+    use control_ms_cmd,   only: init_cmd_maxwell_ms
+    use control_ms_raman, only: init_raman_maxwell_ms
     implicit none
     integer :: ia,i,j,imacro
 
@@ -539,8 +541,12 @@ contains
        end do
     endif
 
-    !!AY force field + FDTD:
-    if(theory == 'Raman') call init_ms_raman
+    ! theory is not TDDFT
+    if(theory == 'CMD')   call init_cmd_sc
+    if(use_ms_maxwell == 'y')then
+       if(theory == 'Raman') call init_raman_maxwell_ms
+       if(theory == 'CMD'  ) call init_cmd_maxwell_ms
+    endif
 
     call comm_sync_all
     

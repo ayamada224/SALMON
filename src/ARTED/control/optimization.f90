@@ -899,24 +899,6 @@ end subroutine calc_opt_ground_state_useE
     return
   end subroutine
 
-  subroutine cal_mean_max_forces(NI,f,fave,fmax)
-    implicit none
-    integer ia,NI,NIfree
-    real(8) :: f(3,NI),fave,fmax,fabs
-    fmax   = 0d0
-    fave   = 0d0
-    NIfree = 0
-    do ia=1,NI
-       if(flag_geo_opt_atom(ia)=='n') cycle  !fix atom
-       NIfree = NIfree + 1
-       fabs = f(1,ia)**2 + f(2,ia)**2 + f(3,ia)**2
-       fave = fave + fabs
-       if(fabs .ge. fmax) fmax = fabs
-    enddo
-    fmax = sqrt(fmax)
-    fave = sqrt(fave/NIfree)
-  end subroutine
-
 subroutine add_alpha_save(nsave,alpha_save,ene_save,alpha,ene)
 ! save alpha and it's Eall for line search
   integer :: i,nsave,n
@@ -991,5 +973,24 @@ subroutine find_min_from_save(nsave,alpha_save,ene_save,alpha3p,ene3p,flag_min_f
 end subroutine
 
 end subroutine calc_opt_ground_state
+
+  subroutine cal_mean_max_forces(NI,f,fave,fmax)
+    use Global_Variables, only: flag_geo_opt_atom
+    implicit none
+    integer ia,NI,NIfree
+    real(8) :: f(3,NI),fave,fmax,fabs
+    fmax   = 0d0
+    fave   = 0d0
+    NIfree = 0
+    do ia=1,NI
+       if(flag_geo_opt_atom(ia)=='n') cycle  !fix atom
+       NIfree = NIfree + 1
+       fabs = f(1,ia)**2 + f(2,ia)**2 + f(3,ia)**2
+       fave = fave + fabs
+       if(fabs .ge. fmax) fmax = fabs
+    enddo
+    fmax = sqrt(fmax)
+    fave = sqrt(fave/NIfree)
+  end subroutine
 
 end module optimization

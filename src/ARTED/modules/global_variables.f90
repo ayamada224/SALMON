@@ -325,6 +325,14 @@ Module Global_Variables
   ! Exchange Correlation
   type(xc_functional) :: xc_func
 
+  ! CMD
+  integer :: nmol_s, nmol
+  integer,allocatable :: natom_mol_s(:), natom_mol(:)
+  integer,allocatable :: mol2species(:), mol2atom_top(:), mol2atom_cnt(:)
+  real(8) :: Uene,Tene
+  character(20),allocatable :: name_mol_s(:)
+  character(20) :: force_field_system
+
   interface 
     subroutine total_Energy_omp(Rion_update,GS_RT,ixy_m)
       integer,intent(in) :: GS_RT

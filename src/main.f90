@@ -31,9 +31,12 @@ program main
     case default
       stop 'invalid iperiodic'
     end select
+  case('CMD')     !AY just trial (not open function now)
+   !call arted
+    call cmd
   case('Maxwell')
     call classic_em
- !case('Raman')   !AY just trial (not open function)
+ !case('Raman')   !AY just trial (not open function now)
  !  call arted
   case default
     stop 'invalid theory'

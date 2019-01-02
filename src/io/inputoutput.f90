@@ -801,7 +801,7 @@ contains
     set_ini_velocity      = 'n'
     file_ini_velocity     = 'none'
     file_set_shake        = 'none'
-    thermostat_tau        =  41.34d0  !=1fs: just test value
+    thermostat_tau        =  1d0  !=1fs=41.34au: just test value
     friction              =  0d0
     stop_system_momt      = 'n'
 !! == default for &misc
