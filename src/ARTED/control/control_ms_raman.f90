@@ -1573,7 +1573,7 @@ contains
     tmp_f(3)      = E_tot(1)*tmp_z_mat(1) + E_tot(2)*tmp_z_mat(2) + E_tot(3)*tmp_z_mat(3)
 
     do ia=1,NI
-      Fion_E2(:,ia) = 0.5d0 * aLxyz * c_pmode(ia) / dble(NI) * tmp_f(:)
+      Fion_E2(:,ia) = -0.5d0 * aLxyz * c_pmode(ia) / dble(NI) * tmp_f(:)
       force_m(:,ia,imacro) = force_m(:,ia,imacro) + Fion_E2(:,ia)
 
 !      tmp1_mat(1:3) = matmul(dchidq(1:3,1:3),E_tot(1:3))
