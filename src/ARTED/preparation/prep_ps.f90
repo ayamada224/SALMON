@@ -29,24 +29,24 @@ Subroutine prep_ps_periodic(property)
   implicit none
   character(17) :: property
   logical :: flag_alloc1, flag_alloc2
-  integer :: ik,i,a,j,ix,iy,iz,ir,intr
+  integer :: ik,i,a,j,ix,iy,iz,l,m,lm,ir,intr
   integer :: PNLx,PNLy,PNLz,narray
   real(8) :: x,y,z,r
   real(8) :: ratio1,ratio2,rc
-  real(8) :: rinv_hxyz 
+  real(8) :: rinv_hxyz
 
 
   !(Local pseudopotential in G-space (radial part))
   if(property == 'initial') then
 
     allocate(lma_tbl((Lmax+1)**2,NI))
-    call init_lma_tbl(pp)
+    call init_lma_tbl(pp,ppg)
 
     call calc_vloc(pp,dVloc_G,Gx,Gy,Gz,NG,NG_s,NG_e,ngzero)
 
     !(this save is used only for opt and md options)
     save_dVloc_G(:,:)=dVloc_G(:,:)
-     
+
   else
 
     dVloc_G(:,:)=save_dVloc_G(:,:)
@@ -69,7 +69,7 @@ Subroutine prep_ps_periodic(property)
 
   call calc_vpsl(pp,rhoion_G,Vpsl_ia,Vpsl,  &
                  dVloc_G,nGzero,Gx,Gy,Gz,NG,NG_s,NG_e,NL,aLxyz,Lx,Ly,Lz,Hx,Hy,Hz)
- 
+
   !(Non-Local pseudopotential)
   if(property /= 'update_wo_realloc') then
 
@@ -78,7 +78,7 @@ Subroutine prep_ps_periodic(property)
     write(*,*) '============nonlocal grid data=============='
   endif
 
-  call calc_mps(pp,ppg,alx,aly,alz,lx,ly,lz,nl,hx,hy,hz)
+  call calc_mps(pp,ppg,alx,aly,alz,lx,ly,lz,nl,lx,ly,lz,nl,hx,hy,hz)
 
   nps=ppg%nps
   Mps(1:NI)=ppg%mps(1:NI)
@@ -96,6 +96,7 @@ Subroutine prep_ps_periodic(property)
      narray=ubound(Jxyz,1)
      if(Nps.ne.narray)then
         deallocate(Jxyz,Jxx,Jyy,Jzz,zJxyz)
+        call finalize_jxyz(ppg)
         deallocate(ekr,ekr_omp)
 #ifdef ARTED_STENCIL_PADDING
         deallocate(zKxyz)
@@ -107,13 +108,14 @@ Subroutine prep_ps_periodic(property)
   endif
   if(flag_alloc1)then
      allocate(Jxyz(Nps,NI),Jxx(Nps,NI),Jyy(Nps,NI),Jzz(Nps,NI),zJxyz(Nps,NI))
+     call init_jxyz(ppg)
      allocate(ekr_omp(Nps,NI,NK_s:NK_e),ekr(Nps,NI))
 #ifdef ARTED_STENCIL_PADDING
      allocate(zKxyz(Nps,NI))
 #endif
   endif
 
-  call calc_jxyz(pp,ppg,aLx,aLy,aLz,Lx,Ly,Lz,NL,Hx,Hy,Hz)
+  call calc_jxyz(pp,ppg,aLx,aLy,aLz,Lx,Ly,Lz,NL,Lx,Ly,Lz,NL,Hx,Hy,Hz)
 
   Jxyz(1:Nps,1:NI)=ppg%jxyz(3,1:Nps,1:NI)+1+NLz*ppg%jxyz(2,1:Nps,1:NI)+NLy*NLz*ppg%jxyz(1,1:Nps,1:NI)
   Jxx(:,:) =ppg%jxx(:,:)
@@ -143,8 +145,8 @@ Subroutine prep_ps_periodic(property)
 
   endif
 
-  call set_nlma(pp)
-  Nlma=pp%nlma
+  call set_nlma(pp,ppg)
+  Nlma=ppg%nlma
 
   !(allocate/deallocate with Nlma)
   if(property == 'initial') then
@@ -153,7 +155,7 @@ Subroutine prep_ps_periodic(property)
      narray=ubound(a_tbl,1)
      if(Nlma.ne.narray .or. flag_alloc1)then
         deallocate(a_tbl,uV,duV,iuV,zproj)
-        call finalize_uv(pp,ppg)
+        call finalize_uv(ppg)
         flag_alloc2=.true.
      else
         flag_alloc2=.false.
@@ -165,9 +167,9 @@ Subroutine prep_ps_periodic(property)
      call init_uv(pp,ppg)
   endif
 
-  call set_lma_tbl(pp)
-  lma_tbl(:,:)=pp%lma_tbl(:,:)
-  a_tbl(:)=pp%ia_tbl(:)
+  call set_lma_tbl(pp,ppg)
+  lma_tbl(:,:)=ppg%lma_tbl(:,:)
+  a_tbl(:)=ppg%ia_tbl(:)
 
   endif  !for /= 'update_wo_realloc'
 
@@ -191,9 +193,19 @@ Subroutine prep_ps_periodic(property)
   uv(:,:)=ppg%uv(:,:)
   duv(:,:,:)=ppg%duv(:,:,:)
 
-  if(property /= 'update_wo_realloc') then
-    iuv(:)=pp%rinv_uvu(:)*rinv_hxyz
-  end if
+  do a=1,natom
+    ik=Kion(a)
+    if(property /= 'update_wo_realloc') then
+      lm=0
+      do l=0,Mlps(ik)
+        if(inorm(l,ik)==0) cycle
+        do m=-l,l
+          lm=lm+1
+          iuV(lma_tbl(lm,a))=inorm(l,ik)
+        enddo
+      enddo
+    endif
+  enddo
 
 ! nonlinear core-correction
   rho_nlcc = 0d0
@@ -210,7 +222,7 @@ Subroutine prep_ps_periodic(property)
         end if
         if(i == Nrmax) stop "no-cut-off"
       end do
-      
+
       do ix=-2,2; do iy=-2,2; do iz=-2,2
         do i=1,NL
           x=Lx(i)*Hx-(Rion(1,a)+ix*aLx)
@@ -218,7 +230,7 @@ Subroutine prep_ps_periodic(property)
           z=Lz(i)*Hz-(Rion(3,a)+iz*aLz)
           r=sqrt(x**2+y**2+z**2)
           if(r > rc)cycle
-          
+
           do ir=1,NRmax
             if(rad(ir,ik).gt.r) exit
           enddo
@@ -230,9 +242,9 @@ Subroutine prep_ps_periodic(property)
             +ratio1*rho_nlcc_tbl(intr+1,ik)+ratio2*rho_nlcc_tbl(intr,ik)
           tau_nlcc(i) = tau_nlcc(i) &
             +ratio1*tau_nlcc_tbl(intr+1,ik)+ratio2*tau_nlcc_tbl(intr,ik)
-          
+
         enddo
-        
+
       end do; end do; end do
     end do
   end if

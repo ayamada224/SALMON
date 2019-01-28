@@ -145,16 +145,50 @@ subroutine calc_vpsl(pp,rhoion_g,vpsl_ia,vpsl,dvloc_g,  &
 end subroutine calc_vpsl
 
 !--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
+subroutine init_mps(ppg)
+  use salmon_global,only : natom
+  use salmon_pp,only : pp_grid
+  implicit none 
+  type(pp_grid) :: ppg
 
-subroutine calc_mps(pp,ppg,alx,aly,alz,lx,ly,lz,nl,hx,hy,hz)
-  use salmon_global,only : natom,kion,rion,iperiodic
+  allocate(ppg%mps(natom))
+
+end subroutine init_mps
+!--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
+subroutine init_jxyz(ppg)
+  use salmon_global,only : natom
+  use salmon_pp,only : pp_grid
+  implicit none 
+  type(pp_grid) :: ppg
+
+  allocate(ppg%jxyz(3,ppg%nps,natom))
+  allocate(ppg%jxx( ppg%nps,natom))
+  allocate(ppg%jyy( ppg%nps,natom))
+  allocate(ppg%jzz( ppg%nps,natom))
+
+end subroutine init_jxyz
+!--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
+subroutine finalize_jxyz(ppg)
+  use salmon_pp,only : pp_grid
+  implicit none 
+  type(pp_grid) :: ppg
+
+  deallocate(ppg%jxyz)
+  deallocate(ppg%jxx,ppg%jyy,ppg%jzz)
+
+end subroutine finalize_jxyz
+!--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
+
+subroutine calc_mps(pp,ppg,alx,aly,alz,lx,ly,lz,nl,mx,my,mz,ml,hx,hy,hz)
+  use salmon_global,only : natom,kion,rion,iperiodic,domain_parallel
   use salmon_pp,only : pp_info,pp_grid
   implicit none
   type(pp_info) :: pp
   type(pp_grid) :: ppg
   real(8),intent(in) :: alx,aly,alz
-  integer,intent(in) :: nl
+  integer,intent(in) :: nl,ml
   integer,intent(in) :: lx(nl),ly(nl),lz(nl)
+  integer,intent(in) :: mx(ml),my(ml),mz(ml)
   real(8),intent(in) :: hx,hy,hz
   integer :: a,i,ik,ix,iy,iz,j
   integer :: nc
@@ -184,8 +218,14 @@ subroutine calc_mps(pp,ppg,alx,aly,alz,lx,ly,lz,nl,hx,hy,hz)
     else
       rshift(3)=-0.5d0*Hz
     end if
-  else if(iperiodic==3)then 
-    rshift(:)=0.d0
+  else if(iperiodic==3)then
+    if(domain_parallel=='y')then
+      rshift(1)=-Hx
+      rshift(2)=-Hy
+      rshift(3)=-Hz
+    else
+      rshift(:)=0.d0
+    end if
   end if
 
 
@@ -200,10 +240,10 @@ subroutine calc_mps(pp,ppg,alx,aly,alz,lx,ly,lz,nl,hx,hy,hz)
       tmpx = rion(1,a)+ix*alx
       tmpy = rion(2,a)+iy*aly
       tmpz = rion(3,a)+iz*alz
-      do i=1,NL
-        x=lx(i)*Hx+rshift(1)-tmpx
-        y=ly(i)*Hy+rshift(2)-tmpy
-        z=lz(i)*Hz+rshift(3)-tmpz
+      do i=1,ml
+        x=mx(i)*Hx+rshift(1)-tmpx
+        y=my(i)*Hy+rshift(2)-tmpy
+        z=mz(i)*Hz+rshift(3)-tmpz
         r=sqrt(x*x+y*y+z*z)
         if (r<pp%rps(ik)) j=j+1
       enddo
@@ -220,15 +260,16 @@ subroutine calc_mps(pp,ppg,alx,aly,alz,lx,ly,lz,nl,hx,hy,hz)
 end subroutine calc_mps
 
 !--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
-subroutine calc_jxyz(pp,ppg,alx,aly,alz,lx,ly,lz,nl,hx,hy,hz)
-  use salmon_global,only : natom,kion,rion,iperiodic
+subroutine calc_jxyz(pp,ppg,alx,aly,alz,lx,ly,lz,nl,mx,my,mz,ml,hx,hy,hz)
+  use salmon_global,only : natom,kion,rion,iperiodic,domain_parallel
   use salmon_pp,only : pp_info,pp_grid
   implicit none
   type(pp_info) :: pp
   type(pp_grid) :: ppg
   real(8),intent(in) :: alx,aly,alz
-  integer,intent(in) :: nl
+  integer,intent(in) :: nl,ml
   integer,intent(in) :: lx(nl),ly(nl),lz(nl)
+  integer,intent(in) :: mx(ml),my(ml),mz(ml)
   real(8),intent(in) :: hx,hy,hz
   integer :: a,i,ik,ix,iy,iz,j
   integer :: nc
@@ -259,13 +300,14 @@ subroutine calc_jxyz(pp,ppg,alx,aly,alz,lx,ly,lz,nl,hx,hy,hz)
       rshift(3)=-0.5d0*Hz
     end if
   else if(iperiodic==3)then 
-    rshift(:)=0.d0
+    if(domain_parallel=='y')then
+      rshift(1)=-Hx
+      rshift(2)=-Hy
+      rshift(3)=-Hz
+    else
+      rshift(:)=0.d0
+    end if
   end if
-
-  allocate(ppg%jxyz(3,ppg%nps,natom))
-  allocate(ppg%jxx( ppg%nps,natom))
-  allocate(ppg%jyy( ppg%nps,natom))
-  allocate(ppg%jzz( ppg%nps,natom))
 
 !$omp parallel
 !$omp do private(a,ik,j,ix,iy,iz,tmpx,tmpy,tmpz,i,x,y,z,r)
@@ -278,17 +320,17 @@ subroutine calc_jxyz(pp,ppg,alx,aly,alz,lx,ly,lz,nl,hx,hy,hz)
       tmpx = rion(1,a)+ix*aLx
       tmpy = rion(2,a)+iy*aLy
       tmpz = rion(3,a)+iz*aLz
-      do i=1,NL
-        x=lx(i)*Hx+rshift(1)-tmpx
-        y=ly(i)*Hy+rshift(2)-tmpy
-        z=lz(i)*Hz+rshift(3)-tmpz
+      do i=1,ml
+        x=mx(i)*Hx+rshift(1)-tmpx
+        y=my(i)*Hy+rshift(2)-tmpy
+        z=mz(i)*Hz+rshift(3)-tmpz
         r=sqrt(x*x+y*y+z*z)
         if (r<pp%rps(ik)) then
           j=j+1
           if (j<=ppg%nps) then
-            ppg%jxyz(1,j,a)=lx(i)
-            ppg%jxyz(2,j,a)=ly(i)
-            ppg%jxyz(3,j,a)=lz(i)
+            ppg%jxyz(1,j,a)=mx(i)
+            ppg%jxyz(2,j,a)=my(i)
+            ppg%jxyz(3,j,a)=mz(i)
             ppg%jxx( j,a)=ix
             ppg%jyy( j,a)=iy
             ppg%jzz( j,a)=iz
@@ -304,22 +346,23 @@ subroutine calc_jxyz(pp,ppg,alx,aly,alz,lx,ly,lz,nl,hx,hy,hz)
 
 end subroutine calc_jxyz
 !--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
-subroutine init_lma_tbl(pp)
+subroutine init_lma_tbl(pp,ppg)
   use salmon_global,only : natom
-  use salmon_pp,only : pp_info
+  use salmon_pp,only : pp_info,pp_grid
   implicit none 
   type(pp_info) :: pp
+  type(pp_grid) :: ppg
 
-  allocate(pp%lma_tbl((pp%lmax+1)**2,natom))
+  allocate(ppg%lma_tbl((pp%lmax+1)**2,natom))
 
 end subroutine init_lma_tbl
 !--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
-subroutine finalize_lma_tbl(pp)
-  use salmon_pp,only : pp_info
+subroutine finalize_lma_tbl(ppg)
+  use salmon_pp,only : pp_grid
   implicit none 
-  type(pp_info) :: pp
+  type(pp_grid) :: ppg
 
-  deallocate(pp%lma_tbl)
+  deallocate(ppg%lma_tbl)
 
 end subroutine finalize_lma_tbl
 !--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
@@ -330,28 +373,28 @@ subroutine init_uv(pp,ppg)
   type(pp_info) :: pp
   type(pp_grid) :: ppg
 
-  allocate(pp%ia_tbl((pp%lmax+1)**2*natom))
-  allocate(pp%rinv_uvu((pp%lmax+1)**2*natom))
-  allocate(ppg%uv(ppg%nps,pp%nlma),ppg%duv(ppg%nps,pp%nlma,3))
+  allocate(ppg%ia_tbl((pp%lmax+1)**2*natom))
+  allocate(ppg%rinv_uvu((pp%lmax+1)**2*natom))
+  allocate(ppg%uv(ppg%nps,ppg%nlma),ppg%duv(ppg%nps,ppg%nlma,3))
 
 end subroutine init_uv
 !--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
-subroutine finalize_uv(pp,ppg)
-  use salmon_pp,only : pp_info,pp_grid
+subroutine finalize_uv(ppg)
+  use salmon_pp,only : pp_grid
   implicit none 
-  type(pp_info) :: pp
   type(pp_grid) :: ppg
 
-  deallocate(pp%ia_tbl,pp%rinv_uvu)
+  deallocate(ppg%ia_tbl,ppg%rinv_uvu)
   deallocate(ppg%uv,ppg%duv)
 
 end subroutine finalize_uv
 !--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
-subroutine set_nlma(pp)
+subroutine set_nlma(pp,ppg)
   use salmon_global,only : natom,kion
   use salmon_pp,only : pp_info,pp_grid
   implicit none 
   type(pp_info) :: pp
+  type(pp_grid) :: ppg
   integer :: lma
   integer :: a,ik,m,l
 
@@ -365,15 +408,16 @@ subroutine set_nlma(pp)
       enddo
     enddo
   enddo
-  pp%nlma=lma
+  ppg%nlma=lma
 
 end subroutine set_nlma
 !--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
-subroutine set_lma_tbl(pp)
+subroutine set_lma_tbl(pp,ppg)
   use salmon_global,only : natom,kion
-  use salmon_pp,only : pp_info
+  use salmon_pp,only : pp_info,pp_grid
   implicit none 
   type(pp_info) :: pp
+  type(pp_grid) :: ppg
   integer :: lm,lma
   integer :: a,ik,m,l
 
@@ -386,8 +430,8 @@ subroutine set_lma_tbl(pp)
       do m=-l,l
         lm=lm+1
         lma=lma+1
-        pp%lma_tbl(lm,a)=lma
-        pp%ia_tbl(lma)=a
+        ppg%lma_tbl(lm,a)=lma
+        ppg%ia_tbl(lma)=a
       enddo
     enddo
   enddo
@@ -397,7 +441,7 @@ end subroutine set_lma_tbl
 subroutine calc_uv(pp,ppg,save_udvtbl_a,save_udvtbl_b,save_udvtbl_c,save_udvtbl_d, &
                    lx,ly,lz,nl,hx,hy,hz,alx,aly,alz,  &
                    flag_use_grad_wf_on_force,property)
-  use salmon_global,only : natom,nelem,kion,rion,iperiodic,domain_parallel
+  use salmon_global,only : natom,kion,rion,iperiodic,domain_parallel
   use salmon_pp,only : pp_info,pp_grid
   implicit none
   real(8),parameter :: pi=3.141592653589793d0 ! copied from salmon_math
@@ -444,8 +488,15 @@ subroutine calc_uv(pp,ppg,save_udvtbl_a,save_udvtbl_b,save_udvtbl_c,save_udvtbl_
       rshift(3)=-0.5d0*Hz
     end if
   else if(iperiodic==3)then 
-    rshift(:)=0.d0
+    if(domain_parallel=='y')then
+      rshift(1)=-Hx
+      rshift(2)=-Hy
+      rshift(3)=-Hz
+    else
+      rshift(:)=0.d0
+    end if
   end if
+
   if(property /= 'update_wo_realloc') then
 
     do a=1,natom
@@ -511,7 +562,7 @@ subroutine calc_uv(pp,ppg,save_udvtbl_a,save_udvtbl_b,save_udvtbl_c,save_udvtbl_
          if(pp%inorm(l,ik)==0) cycle
          do m=-l,l
            lm=lm+1
-           ilma=pp%lma_tbl(lm,a)
+           ilma=ppg%lma_tbl(lm,a)
            ppg%uv(j,ilma)=uvr(l)*ylm(x,y,z,l,m)
            if(.not.flag_use_grad_wf_on_force)then !legacy for ion-force
              if(r>1d-6)then
@@ -541,7 +592,7 @@ subroutine calc_uv(pp,ppg,save_udvtbl_a,save_udvtbl_b,save_udvtbl_c,save_udvtbl_
       if(pp%inorm(l,ik)==0) cycle
       do m=-l,l
         lma=lma+1
-        pp%rinv_uvu(lma)=dble(pp%inorm(l,ik))*hvol
+        ppg%rinv_uvu(lma)=dble(pp%inorm(l,ik))*hvol
       enddo
     enddo
     endif
