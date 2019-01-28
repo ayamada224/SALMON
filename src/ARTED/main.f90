@@ -37,8 +37,6 @@ subroutine arted
   use salmon_global,   only: use_ms_maxwell,use_geometry_opt,restart_option
   use control_sc,      only: tddft_sc
   use control_ms,      only: tddft_maxwell_ms
-  use control_sc_cmd,  only: cmd_sc
-  use control_ms_cmd,  only: cmd_maxwell_ms
   use control_ms_raman,only: raman_maxwell_ms
   use optimization,    only: calc_opt_ground_state
   use md_ground_state, only: calc_md_ground_state
@@ -55,51 +53,47 @@ subroutine arted
   nproc_id_tdks    = nproc_id_global
   nproc_size_tdks  = nproc_size_global
 
+  if(use_potential_model=='CMD') then
+     call cmd !goto main for classical MD (temporal way)
+     return
+  endif
+
   call initialize
 
-  if(theory=='TDDFT')then
-     if(restart_option == 'new')then
-        select case(iflag_calc_mode)
-        case(iflag_calc_mode_gs_rt)
-           call calc_ground_state
-           if(write_gs_wfn_k=='y') call read_write_gs_wfn_k(iflag_write)
-        case(iflag_calc_mode_gs)
-           call calc_ground_state
-           call read_write_gs_wfn_k(iflag_write)
-           if(use_geometry_opt=='y') call calc_opt_ground_state
-           if(use_adiabatic_md=='y') call calc_md_ground_state
-           return
-        case(iflag_calc_mode_rt)
-           if(use_ms_maxwell=='y' .and. read_gs_wfn_k_ms=='y' ) then
-              call read_gs_wfn_k_ms_each_macro_grid
-           else if(use_ms_maxwell=='y' .and. read_rt_wfn_k_ms=='y') then
-              call read_write_rt_wfn_k_ms_each_macro_grid(iflag_read_rt)
-           else
-              call read_write_gs_wfn_k(iflag_read)
-              if(read_rt_wfn_k=='y') call read_write_rt_wfn_k(iflag_read_rt)
-           endif
-        end select
-     else if(restart_option == 'restart')then
-     else
-        call Err_finalize("Invalid restart_option!")
-     end if
-  else if(theory=='CMD')then
-     !!
-  endif
+  if(restart_option == 'new')then
+    select case(iflag_calc_mode)
+    case(iflag_calc_mode_gs_rt)
+      call calc_ground_state
+      if(write_gs_wfn_k=='y') call read_write_gs_wfn_k(iflag_write)
+    case(iflag_calc_mode_gs)
+      call calc_ground_state
+      call read_write_gs_wfn_k(iflag_write)
+      if(use_geometry_opt=='y') call calc_opt_ground_state
+      if(use_adiabatic_md=='y') call calc_md_ground_state
+      return
+    case(iflag_calc_mode_rt)
+      if(use_ms_maxwell=='y' .and. read_gs_wfn_k_ms=='y' ) then
+         call read_gs_wfn_k_ms_each_macro_grid
+      else if(use_ms_maxwell=='y' .and. read_rt_wfn_k_ms=='y') then
+         call read_write_rt_wfn_k_ms_each_macro_grid(iflag_read_rt)
+      else
+         call read_write_gs_wfn_k(iflag_read)
+         if(read_rt_wfn_k=='y') call read_write_rt_wfn_k(iflag_read_rt)
+      endif
+    end select
+  else if(restart_option == 'restart')then
+  else
+    call Err_finalize("Invalid restart_option!")
+  end if
 
   select case(use_ms_maxwell)
   case ('y')
-     if(theory == 'TDDFT') call tddft_maxwell_ms
-     if(theory == 'CMD'  ) call cmd_maxwell_ms
-     if(theory == 'Raman') call raman_maxwell_ms
+     if( use_potential_model == 'n'    ) call tddft_maxwell_ms
+    !if( use_potential_model == 'Raman') call raman_maxwell_ms  !not open yet
      if(write_rt_wfn_k_ms=='y') call read_write_rt_wfn_k_ms_each_macro_grid(iflag_write_rt)
   case ('n')
-     if(theory == 'TDDFT') then
-        call tddft_sc
-        if(write_rt_wfn_k=='y') call read_write_rt_wfn_k(iflag_write_rt)
-     else if(theory == 'CMD') then
-        call cmd_sc
-     endif
+     call tddft_sc
+     if(write_rt_wfn_k=='y') call read_write_rt_wfn_k(iflag_write_rt)
   case default
      call Err_finalize("Invalid use_ms_maxwell parameter!")
   end select

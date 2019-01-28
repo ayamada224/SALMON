@@ -147,7 +147,8 @@ contains
 
     fmax_conv = convrg_opt_fmax
 !    step_size = 0.002d0  !test
-    step_size = 0.0005d0  !test
+    step_size = 0.001d0  !test
+!    step_size = 0.0005d0  !test
     zero = 0d0
 
     call cal_force_energy_CRK
@@ -210,10 +211,11 @@ contains
 
     enddo  !main loop of it
 
+    velocity(:,:) = 0d0
+    call print_restart_data_md_gs
     call comm_sync_all
 
     if(comm_is_root(nproc_id_global)) write(*,*) 'This calculation is shutdown successfully!'
-
 
   end subroutine
 
@@ -325,7 +327,7 @@ contains
        ! Export to standard log file
        if(comm_is_root(nproc_id_global)) then
           write(*,120) it*dt,Tene,Uene,Eall,Enh,Htot,Temp_sys
-120       format(1x,f10.4, 7e20.10E3,f12.3)
+120       format(1x,f14.4, 7e20.10E3,f12.3)
        endif
 
        ! Export to file_trj

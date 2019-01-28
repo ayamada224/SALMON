@@ -99,7 +99,8 @@ contains
 ! initialize for optimization.
     call opt_vars_initialize_p2
 
-    if(use_ehrenfest_md=='y' .or. use_adiabatic_md=='y' .or. theory=='CMD') then
+    if(use_ehrenfest_md=='y' .or. use_adiabatic_md=='y' .or. &
+       use_potential_model=='CMD' ) then
        call init_md
     endif
 
@@ -541,12 +542,7 @@ contains
        end do
     endif
 
-    ! theory is not TDDFT
-    if(theory == 'CMD')   call init_cmd_sc
-    if(use_ms_maxwell == 'y')then
-       if(theory == 'Raman') call init_raman_maxwell_ms
-       if(theory == 'CMD'  ) call init_cmd_maxwell_ms
-    endif
+    if(use_potential_model == 'Raman') call init_raman_maxwell_ms
 
     call comm_sync_all
     
@@ -574,11 +570,11 @@ contains
        call set_initial_velocity
        if(set_ini_velocity=='r') call read_initial_velocity
 
-       if (use_ms_maxwell == 'y' .and. theory == 'TDDFT') then
-          if(nmacro_s .ne. nmacro_e .or. nproc_size_global.ne.nmacro)then
+       if (use_ms_maxwell == 'y' .and. use_potential_model=='n') then
+          if(nproc_size_global.lt.nmacro)then
              write(*,*) "Error: "
-             write(*,*) "  number of parallelization nodes must be equal to number of macro grids"
-             write(*,*) "  in ehrenfest md option with multi-scale"
+             write(*,*) "  number of parallelization nodes must be equal to or larger than  number of macro grids"
+             write(*,*) "  in md option with multi-scale"
              call end_parallel
              stop
           endif
