@@ -21,10 +21,11 @@ module force_field_CRK
   use salmon_parallel
   use salmon_communication
   implicit none
-  logical :: flag_use_Xatoms, flag_use_ewald_cln, flag_use_dump_f, flag_use_conf_dep_chg
-  integer :: NI_wX, iter_max
+  logical :: flag_use_over_cell
+  integer :: NI_wX, iter_max,ncell_max(3),nc_max
   integer,allocatable :: natom_wX_mol_s(:), natom_wX_mol(:)
   real(8) :: dQave_thresh
+  real(8),allocatable :: Rxyz_wX(:,:,:)
   !each molecule
   integer,allocatable :: iatom_center(:)
   integer,allocatable :: nbnd_r(:), iatom1_bnd_r(:,:), iatom2_bnd_r(:,:)
@@ -44,14 +45,12 @@ module force_field_CRK
   real(8),allocatable :: kb_r(:,:,:), kb_a(:), kb_ra(:), kb_rr(:)
   real(8),allocatable :: Qeq(:), eps_vdw(:), sgm_vdw(:)
   real(8),allocatable :: Qai(:,:)
-
   !switching function for dump_f
   real(8) :: R1_switch,R2_switch, R1_switch2,R2_switch2, R2_R1_swirtch3_inv
   real(8) :: xi_gauss_cln, gm_gauss_cln, coef_derf_gm
-
   !ewald
   integer :: nG_cmd
-  real(8) :: r_cutoff, G_cutoff, L3, a_ewald, coef_derfc,coef_derf1
+  real(8) :: r_cutoff,G_cutoff,L3, a_ewald,coef_derfc,coef_derf1
   real(8),allocatable :: Gvec(:,:),G2(:), sumQicosGri(:),sumQisinGri(:)
 
 contains
@@ -155,10 +154,10 @@ contains
        charge_cln(is,2) = 0.329d0
        charge_cln(is,3) = 0.329d0
 
-!just test
-!       charge_cln(is,1) =-0.4d0*2  ![e]
-!       charge_cln(is,2) = 0.4d0
-!       charge_cln(is,3) = 0.4d0
+       !!just test
+       !charge_cln(is,1) =-0.4d0*2  ![e]
+       !charge_cln(is,2) = 0.4d0
+       !charge_cln(is,3) = 0.4d0
 
        !these charges are used
        Qeq_withX_wat(1) = -0.329d0  ![e] X1 site
@@ -168,9 +167,9 @@ contains
 
        !parameter for conformation-dependent partial charge [a.u.]
        !                 (/   X1, X2, H1, H2  /)
-       dQdS_wat(1:4,1) = (/  0.097d0,  0.097d0, -0.097d0, -0.097d0 /)  !for S1(t=1)
-       dQdS_wat(1:4,2) = (/ -0.060d0, -0.060d0,  0.060d0,  0.060d0 /)  !for S2(t=2)
-       dQdS_wat(1:4,3) = (/  0.0d0,    0.0d0,   -0.049d0,  0.049d0 /)  !for S3(t=3)
+       dQdS_wat(1:4,1) = (/  0.097d0,  0.097d0, -0.097d0, -0.097d0 /) !for S1(t=1)
+       dQdS_wat(1:4,2) = (/ -0.060d0, -0.060d0,  0.060d0,  0.060d0 /) !for S2(t=2)
+       dQdS_wat(1:4,3) = (/  0.0d0,    0.0d0,   -0.049d0,  0.049d0 /) !for S3(t=3)
 
        !parameter of Keq_abi
        !                 (/   X1, X2, H1, H2  /)
@@ -228,14 +227,6 @@ contains
     real(8) :: Q0ai(4,nmol), dQdr_wat(3,4,3,nmol)
     real(8) :: Kai(4,4,nmol), dKdr_wat(3,4,4,3,nmol) 
 
-
-    flag_use_Xatoms        = .true.
-    flag_use_ewald_cln     = .true.
-    flag_use_dump_f        = .true.
-    flag_use_conf_dep_chg  = .true.
-
-    dQave_thresh = 1d-7 ![au]
-
     !(calculate nb_r, nb_a)
     nb_r=0
     nb_a=0
@@ -259,6 +250,7 @@ contains
     enddo
 
     !(allocate)
+    allocate( Rxyz_wX(3,4,nmol) )
     allocate( natom_wX_mol(nmol) )
     allocate( iatom1_b_r(nb_r), iatom2_b_r(nb_r) )
     allocate( iatom1_b_a(nb_a), iatom2_b_a(nb_a) )
@@ -322,15 +314,31 @@ contains
 
     enddo  ! imol
 
-    ! set cutoff radius for non-bonding interaction
-    ! currently, half length of the minimum side length of unit cell
-    r_cutoff = minval(aL)/2d0
-    if (comm_is_root(nproc_id_global)) write(*,*) "R-cutoff radius =",r_cutoff*au_length_aa," [A]"
-
+    !(some parameters)
+    dQave_thresh = 1d-7 ![au]
     iter_max = 50
+    r_cutoff = 13.0d0/au_length_aa ! [Bohr]
+    G_cutoff = 1.47d0*au_length_aa ! [1/Bohr]
 
-    if(flag_use_dump_f)    call init_dump_f
-    if(flag_use_ewald_cln) call init_ewald_CRK
+    !(cutoff for real space)
+    flag_use_over_cell=.false.
+    if(r_cutoff .gt. minval(aL)/2d0) then
+      !r_cutoff = minval(aL)/2d0
+       flag_use_over_cell=.true.
+       ncell_max(:) = int(r_cutoff/aL(:))+1
+    endif
+    if(flag_use_over_cell) then
+       nc_max = (2*ncell_max(1)+1)*(2*ncell_max(2)+1)*(2*ncell_max(3)+1)
+    else
+       nc_max = 1
+    endif
+    if(comm_is_root(nproc_id_global)) write(*,*) "R-cutoff radius =",r_cutoff*au_length_aa," [A]"
+    if(comm_is_root(nproc_id_global)) write(*,*) "G-cutoff radius =",G_cutoff/au_length_aa," [1/A]"
+    if(comm_is_root(nproc_id_global)) write(*,*) "# of cells used in R-cutoff=",ncell_max(:)
+    if(comm_is_root(nproc_id_global)) write(*,*) "nc_max=",nc_max
+
+    call init_dump_f
+    call init_ewald_CRK
 
     do imol=1,nmol
        is = mol2species(imol)
@@ -356,13 +364,7 @@ contains
     force(:,:) = 0d0
 
     call force_energy_intramolecular_CRK
-    if(flag_use_ewald_cln) then
-       call force_energy_intermolecular_CRK
-    else
-       call force_energy_intermolecular_CRK_simple
-    endif
-!    call force_energy_intermolecular_CRK_practice
-
+    call force_energy_intermolecular_CRK
 
   end subroutine
 
@@ -376,6 +378,7 @@ contains
     real(8) :: r13_vec(3,nb_a), r13_dist(nb_a), dr13_dist(nb_a)
 
     !calc dr for all 1-2 and 1-3 bonds
+!$omp parallel do private(ib_r,iatom1,iatom2)
     do ib_r= 1,nb_r
        iatom1 = iatom1_b_r(ib_r)
        iatom2 = iatom2_b_r(ib_r)
@@ -383,6 +386,8 @@ contains
        r12_dist(ib_r)  = sqrt(sum(r12_vec(:,ib_r)*r12_vec(:,ib_r)))
        dr12_dist(ib_r) = r12_dist(ib_r) - r0_b_r(ib_r)
     enddo
+!$omp end parallel do
+!$omp parallel do private(ib_a,iatom1,iatom2)
     do ib_a= 1,nb_a
        iatom1 = iatom1_b_a(ib_a)
        iatom2 = iatom2_b_a(ib_a)
@@ -390,10 +395,13 @@ contains
        r13_dist(ib_a)  = sqrt(sum(r13_vec(:,ib_a)*r13_vec(:,ib_a)))
        dr13_dist(ib_a) = r13_dist(ib_a) - r0_b_a(ib_a)
     enddo
+!$omp end parallel do
 
     ene1 = 0d0
 
     ! sum_n kn*(dr12)^n term
+!$omp parallel do private(ib_r,iatom1,iatom2,dr12_pow,ipow,isign,f_tmp) &
+!$omp    reduction(+:force,ene1)
     do ib_r= 1,nb_r
        iatom1 = iatom1_b_r(ib_r)
        iatom2 = iatom2_b_r(ib_r)
@@ -417,8 +425,13 @@ contains
        enddo
 
     enddo
+!$omp end parallel do
 
     ! krr'*dr12*dr12' term
+!$omp parallel do &
+!$omp    private(ib_rr,ib_r,jb_r,iatom1,iatom2,jatom1,jatom2) &
+!$omp    private(f_tmp_iatom1,f_tmp_iatom2,f_tmp_jatom1,f_tmp_jatom2) &
+!$omp    reduction(+:force,ene1)
     do ib_rr= 1,nb_rr
        ib_r = ibond1_b_rr(ib_rr)
        jb_r = ibond2_b_rr(ib_rr)
@@ -438,8 +451,10 @@ contains
        force(:,jatom2) = force(:,jatom2) + f_tmp_jatom2(:)
        ene1 = ene1 + kb_rr(ib_rr) * dr12_dist(ib_r) * dr12_dist(jb_r)
     enddo
+!$omp end parallel do
 
     ! (ktheta,r/2)*(dr13)^2 term
+!$omp parallel do private(ib_a,iatom1,iatom2,f_tmp) reduction(+:force,ene1)
     do ib_a=1,nb_a
        iatom1 = iatom1_b_a(ib_a)
        iatom2 = iatom2_b_a(ib_a)
@@ -448,7 +463,12 @@ contains
        force(:,iatom2) = force(:,iatom2) - f_tmp(:)
        ene1 = ene1 + 0.5d0 * kb_a(ib_a) * dr13_dist(ib_a) * dr13_dist(ib_a)
     enddo
+!$omp end parallel do
 
+!$omp parallel do &
+!$omp    private(ib_ra,ib_r,ib_a,iatom1,iatom2,jatom1,jatom2) &
+!$omp    private(f_tmp_iatom1,f_tmp_iatom2,f_tmp_jatom1,f_tmp_jatom2) &
+!$omp    reduction(+:force,ene1)
     do ib_ra=1,nb_ra
        ib_r = ibond_b_ra(ib_ra)
        ib_a = iangle_b_ra(ib_ra)
@@ -468,6 +488,7 @@ contains
        force(:,jatom2) = force(:,jatom2) + f_tmp_jatom2(:)
        ene1 = ene1 + kb_ra(ib_ra) * dr12_dist(ib_r) * dr13_dist(ib_a)
     enddo
+!$omp end parallel do
 
     Uene = Uene + ene1
 
@@ -478,14 +499,13 @@ contains
     use salmon_math
     use inputoutput, only: au_length_aa, au_energy_ev
     implicit none
-    integer :: ia,ia_wX, ja_wX, imol,jmol, is,is_wat,index_image(3)
+    integer :: ia,ia_wX, ja_wX, imol,jmol, is,is_wat,index_image(3,nc_max),nc,ic
     integer :: iatom_c, jatom_c, iatom, iter, iX, ixyz, iG
-    real(8) :: drij(3), rij,rij_inv,rij2,rij2_inv,rij6_inv,rij12_inv,r2_cutoff
+    real(8) :: drij(3),drij0(3),rij,rij_inv,rij2,rij2_inv,rij6_inv,rij12_inv,r2_cutoff
     real(8) :: ene_vdw,ene_vdw6,ene_vdw12,ene_cln,ene_cln_self
     real(8) :: eps_sgm6_vdw_wat, eps_sgm12_vdw_wat
     real(8) :: e_tmp, f_tmp, f_tmp_iatom(3), dump_f, dump_dfdr(3)
-    real(8) :: force_wX(3,4,nmol)
-    real(8) :: Rxyz_wX(3,4,nmol), dRXdRatom(3,2,3,3,nmol)
+    real(8) :: force_wX(3,4,nmol), dRXdRatom(3,2,3,3,nmol)
     real(8) :: Qai_old(4,nmol),Q0ai(4,nmol), dQave
     real(8) :: QiQj, dQdr_wat(3,4,3,nmol)
     real(8) :: Kai(4,4,nmol), dKdr_wat(3,4,4,3,nmol) 
@@ -493,10 +513,505 @@ contains
     real(8) :: erf_rij,exp_rij, a_ewald_rij
     real(8) :: tmp_s,tmp_c,tmp_coef,tmp1,tmp2,tmp3
 
-    if(.not. flag_use_Xatoms ) then
-       call Err_finalize("Error: flag_use_Xatoms=false is not supported")
+
+    if(nmol_s.ge.2) then
+       call Err_finalize("Now combination rule of vdw is not supported except for water")
        stop
     endif
+
+    !for water (oxygen)
+    do imol=1,nmol
+       is = mol2species(imol)
+       if(name_mol_s(is)=="WAT"   .or. &
+          name_mol_s(is)=="WATER" .or. &
+          name_mol_s(is)=="Water" .or. &
+          name_mol_s(is)=="water" ) then
+          is_wat = is
+          ia = mol2atom_top(imol)
+          eps_sgm6_vdw_wat = eps_vdw(ia) * sgm_vdw(ia)**6d0
+          eps_sgm12_vdw_wat= eps_vdw(ia) * sgm_vdw(ia)**12d0
+          exit
+        endif
+    enddo
+
+    r2_cutoff = r_cutoff * r_cutoff
+
+    !generate X sites for each water molecules
+    call get_Xatom_wat(Rxyz_wX,dRXdRatom)
+    
+    !get Q0 and Kai
+    call get_Q0_K_wat( Q0ai,dQdr_wat,Kai,dKdr_wat,is_wat )
+    
+    !calculate and save some terms for Ewald
+    ene_vdw6  = 0d0
+    ene_vdw12 = 0d0
+    ene_cln   = 0d0
+
+    dump_f       = 1d0
+    dump_dfdr(:) = 0d0
+
+    !Qai(:,:) = Q0ai(:,:)
+    Vai(:,:) = 0d0
+
+!$omp parallel do &
+!$omp    private(imol,jmol,iatom_c,jatom_c,ic,nc) & 
+!$omp    private(drij,drij0,index_image,rij2,rij2_inv,rij6_inv,rij12_inv) &
+!$omp    private(f_tmp,f_tmp_iatom,ia_wX,ja_wX,rij,rij_inv) &
+!$omp    private(a_ewald_rij,erf_rij,dump_f,dump_dfdr,tmp1) &
+!$omp    reduction(+:Vai,ene_vdw6,ene_vdw12,force,force_wX)
+    do imol=1,nmol
+       iatom_c = mol2atom_cnt(imol)
+       do jmol=imol+1,nmol
+          jatom_c = mol2atom_cnt(jmol)
+
+          drij0(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
+          call image_periodic(drij0,index_image,nc)
+          do ic=1,nc
+          drij(:) = drij0(:) + index_image(:,ic)*aL(:)
+          rij2 = sum(drij(:)*drij(:))
+          if(rij2 .gt. r2_cutoff) cycle   !cut-off
+
+          !! VDW interaction (water, only between oxygen atoms)
+          rij2_inv = 1d0/rij2
+          rij6_inv = rij2_inv*rij2_inv*rij2_inv
+          rij12_inv= rij6_inv*rij6_inv
+          ene_vdw6  = ene_vdw6  + rij6_inv
+          ene_vdw12 = ene_vdw12 + rij12_inv
+          f_tmp = 2d0*eps_sgm12_vdw_wat*rij12_inv - eps_sgm6_vdw_wat*rij6_inv
+          f_tmp_iatom(:) = -f_tmp * 24d0 * rij2_inv * drij(:)
+          force(:,iatom_c) = force(:,iatom_c) + f_tmp_iatom(:)
+          force(:,jatom_c) = force(:,jatom_c) - f_tmp_iatom(:)
+
+          !! Coulomb interaction  Here, just get Vabi before iteration
+          !!    Real Space Term of Ewald (the other terms are after the loop)
+          do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
+          do ja_wX= 1,natom_wX_mol(jmol)
+             drij(:) = (Rxyz_wX(:,ja_wX,jmol)-Rxyz_wX(:,ia_wX,imol)) + index_image(:,ic)*aL(:)
+             rij2    = sum(drij(:)*drij(:))
+             rij     = sqrt(rij2)
+             rij_inv = 1d0/rij
+
+             a_ewald_rij = a_ewald * rij
+             erf_rij     = erf_salmon(a_ewald_rij)
+
+             call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,0)
+             tmp1 = ( dump_f - erf_rij )*rij_inv
+             Vai(ia_wX,imol) = Vai(ia_wX,imol) + Qai(ja_wX,jmol) * tmp1
+             Vai(ja_wX,jmol) = Vai(ja_wX,jmol) + Qai(ia_wX,imol) * tmp1
+
+          enddo
+          enddo
+          enddo !ic
+
+       enddo   !jmol
+    enddo      !imol
+!$omp end parallel do
+
+
+    !! Reciprocal Space Term of Ewald
+    call get_sumQsinGr_sumQcosGr_ewald(Rxyz_wX,Qai)
+    tmp1 = 1d0/(4d0*a_ewald*a_ewald)
+    tmp2 = 2d0*pi/L3 * 2d0
+!$omp parallel do &
+!$omp private(iG,tmp_coef,imol,ia_wX,tmp3,tmp_c,tmp_s) reduction(+:Vai)
+    do iG=1,nG_cmd
+       tmp_coef = tmp2 * exp(-G2(iG)*tmp1)/G2(iG)
+       do imol=1,nmol
+       do ia_wX=1,natom_wX_mol(imol)
+          tmp3  = sum(Gvec(:,iG)*Rxyz_wX(:,ia_wX,imol))
+          tmp_c = cos(tmp3) * sumQicosGri(iG)
+          tmp_s = sin(tmp3) * sumQisinGri(iG)
+          Vai(ia_wX,imol) = Vai(ia_wX,imol) + tmp_coef *(tmp_c + tmp_s)
+       end do
+       end do
+    end do
+!$omp end parallel do
+
+    !! Self Term of Ewald
+    !(for the same atom)
+    tmp1 = a_ewald/sqrt(pi) * 2d0
+!$omp parallel do collapse(2) &
+!$omp private(imol,ia_wX) reduction(+:Vai)
+    do imol=1,nmol
+    do ia_wX=1,natom_wX_mol(imol)
+       Vai(ia_wX,imol) = Vai(ia_wX,imol) - tmp1 * Qai(ia_wX,imol)
+    enddo
+    enddo
+!$omp end parallel do
+
+    !(for the different atoms in the same molecule)
+!$omp parallel do collapse(2) &
+!$omp private(imol,ia_wX,ja_wX,drij,rij2,rij,rij_inv,erf_rij) reduction(+:Vai)
+    do imol=1,nmol
+       do ia_wX= 1,natom_wX_mol(imol)
+       do ja_wX= ia_wX+1,natom_wX_mol(imol)
+
+          drij(:) = Rxyz_wX(:,ja_wX,imol) - Rxyz_wX(:,ia_wX,imol)
+          rij2    = sum(drij(:)*drij(:))
+          rij     = sqrt(rij2)
+          rij_inv = 1d0/rij
+          erf_rij = erf_salmon(a_ewald*rij)
+
+          Vai(ia_wX,imol) = Vai(ia_wX,imol) - Qai(ja_wX,imol) * erf_rij * rij_inv
+          Vai(ja_wX,imol) = Vai(ja_wX,imol) - Qai(ia_wX,imol) * erf_rij * rij_inv
+
+       enddo
+       enddo
+    enddo
+!$omp end parallel do
+
+    !! Iteration for Coulomb
+    do iter=1,iter_max
+
+       !get charge Qai using Vai
+       Qai_old(:,:) = Qai(:,:)
+       dQave = 0d0
+       do imol=1,nmol
+       do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
+          Qai(ia_wX,imol) = Q0ai(ia_wX,imol) + sum( Kai(ia_wX,:,imol)*Vai(:,imol) )
+          dQave = dQave + ( Qai(ia_wX,imol) - Qai_old(ia_wX,imol) )**2
+       enddo
+       enddo
+       dQave = sqrt( dQave/NI_wX )
+
+       !get Vai using Qai
+       Vai(:,:) = 0d0
+
+!$omp parallel do &
+!$omp    private(imol,jmol,iatom_c,jatom_c,ic,nc) & 
+!$omp    private(drij,drij0,index_image,rij2,rij2_inv,rij,rij_inv) &
+!$omp    private(ia_wX,ja_wX,a_ewald_rij,erf_rij,dump_f,dump_dfdr,tmp1) &
+!$omp    reduction(+:Vai)
+       do imol=1,nmol
+          iatom_c = mol2atom_cnt(imol)
+       do jmol=imol+1,nmol
+          jatom_c = mol2atom_cnt(jmol)
+
+          drij0(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
+          call image_periodic(drij0,index_image,nc)
+          do ic=1,nc
+          drij(:) = drij0(:) + index_image(:,ic)*aL(:)
+          rij2 = sum(drij(:)*drij(:))
+          if(rij2 .gt. r2_cutoff) cycle   !cut-off
+
+          !! Coulomb interaction  Here, just get Vabi before iteration
+          !!    Real Space Term of Ewald (the other terms are after the loop)
+          do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
+          do ja_wX= 1,natom_wX_mol(jmol)
+             drij(:) = (Rxyz_wX(:,ja_wX,jmol)-Rxyz_wX(:,ia_wX,imol)) + index_image(:,ic)*aL(:)
+             rij2    = sum(drij(:)*drij(:))
+             rij     = sqrt(rij2)
+             rij_inv = 1d0/rij
+
+             a_ewald_rij = a_ewald * rij
+             erf_rij     = erf_salmon(a_ewald_rij)
+
+             call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,0)
+             tmp1 = ( dump_f - erf_rij )*rij_inv
+             Vai(ia_wX,imol) = Vai(ia_wX,imol) + Qai(ja_wX,jmol) * tmp1
+             Vai(ja_wX,jmol) = Vai(ja_wX,jmol) + Qai(ia_wX,imol) * tmp1
+          enddo
+          enddo
+          enddo  !ic
+       enddo  !jmol
+       enddo  !imol
+!$omp end parallel do
+
+       !! Reciprocal Space Term of Ewald
+       call get_sumQsinGr_sumQcosGr_ewald(Rxyz_wX,Qai)
+       tmp1 = 1d0/(4d0*a_ewald*a_ewald)
+       tmp2 = 2d0*pi/L3 * 2d0
+!$omp parallel do &
+!$omp private(iG,tmp_coef,imol,ia_wX,tmp3,tmp_c,tmp_s) reduction(+:Vai)
+       do iG=1,nG_cmd
+          tmp_coef = tmp2 * exp(-G2(iG)*tmp1)/G2(iG)
+          do imol=1,nmol
+          do ia_wX=1,natom_wX_mol(imol)
+             tmp3  = sum(Gvec(:,iG)*Rxyz_wX(:,ia_wX,imol))
+             tmp_c = cos(tmp3) * sumQicosGri(iG)
+             tmp_s = sin(tmp3) * sumQisinGri(iG)
+             Vai(ia_wX,imol) = Vai(ia_wX,imol) + tmp_coef *(tmp_c + tmp_s)
+          end do
+          end do
+       end do
+!$omp end parallel do
+
+       !! Self Term of Ewald
+       !(for the same atom)
+       tmp1 = -a_ewald/sqrt(pi) * 2d0
+!$omp parallel do collapse(2) &
+!$omp private(imol,ia_wX) reduction(+:Vai)
+       do imol=1,nmol
+       do ia_wX=1,natom_wX_mol(imol)
+          Vai(ia_wX,imol) = Vai(ia_wX,imol) + tmp1 * Qai(ia_wX,imol)
+       enddo
+       enddo
+!$omp end parallel do
+
+       !(for the different atoms in the same molecule)
+!$omp parallel do collapse(2) &
+!$omp private(imol,ia_wX,ja_wX,drij,rij2,rij,rij_inv,erf_rij) reduction(+:Vai)
+       do imol=1,nmol
+          do ia_wX= 1,natom_wX_mol(imol)
+          do ja_wX= ia_wX+1,natom_wX_mol(imol)
+
+             drij(:) = Rxyz_wX(:,ja_wX,imol) - Rxyz_wX(:,ia_wX,imol)
+             rij2    = sum(drij(:)*drij(:))
+             rij     = sqrt(rij2)
+             rij_inv = 1d0/rij
+             erf_rij = erf_salmon(a_ewald*rij)
+
+             Vai(ia_wX,imol) = Vai(ia_wX,imol) - Qai(ja_wX,imol) * erf_rij * rij_inv
+             Vai(ja_wX,imol) = Vai(ja_wX,imol) - Qai(ia_wX,imol) * erf_rij * rij_inv
+
+          enddo
+          enddo
+       enddo
+!$omp end parallel do
+
+       !check convergence
+       if(dQave .le. dQave_thresh) then
+         !write(*,*) "#Qai is converged: dQave=", dQave, iter
+          exit
+       else if(iter == iter_max) then
+          if (comm_is_root(nproc_id_global)) &
+          write(*,*) "#iter=iter_max: not converged", dQave, iter
+       endif
+
+    enddo  !iter
+
+    !write(*,*) "#abs(Qmax),abs(Qmin):", maxval(abs(Qai(:,:))), minval(abs(Qai(:,:))) !hoge
+
+
+    ! Calculate Energy and Focer of Coulomb interaction after convergence
+    force_wX(:,:,:) = 0d0
+!$omp parallel do &
+!$omp    private(imol,jmol,iatom_c,jatom_c,ia_wX,ja_wX,ic,nc) & 
+!$omp    private(drij,drij0,index_image,rij2,rij2_inv,rij,rij_inv) &
+!$omp    private(QiQj,a_ewald_rij,erf_rij,exp_rij,dump_f,dump_dfdr,tmp1) &
+!$omp    private(e_tmp,f_tmp_iatom,ia,ixyz,tmp_sumKV,iatom) &
+!$omp    reduction(+:force_wX,force,ene_cln)
+    do imol=1,nmol
+       iatom_c = mol2atom_cnt(imol)
+       do jmol=imol+1,nmol
+          jatom_c = mol2atom_cnt(jmol)
+
+          drij0(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
+          call image_periodic(drij0,index_image,nc)
+          do ic=1,nc
+          drij(:) = drij0(:) + index_image(:,ic)*aL(:)
+          rij2 = sum(drij(:)*drij(:))
+          if(rij2 .gt. r2_cutoff) cycle   !cut-off
+
+          !! Coulomb interaction 
+          !!    Real Space Term of Ewald (the other terms are after the loop)
+          do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
+          do ja_wX= 1,natom_wX_mol(jmol)
+             drij(:) = (Rxyz_wX(:,ja_wX,jmol)-Rxyz_wX(:,ia_wX,imol)) + index_image(:,ic)*aL(:)
+             rij2    = sum(drij(:)*drij(:))
+             rij     = sqrt(rij2)
+             rij_inv = 1d0/rij
+             rij2_inv= 1d0/rij2
+
+             QiQj        = Qai(ia_wX,imol) * Qai(ja_wX,jmol)
+             a_ewald_rij = a_ewald * rij
+             erf_rij    = erf_salmon(a_ewald_rij)
+             exp_rij     = exp(-a_ewald_rij * a_ewald_rij)
+
+             call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,1)
+             e_tmp          = QiQj * ( dump_f -  erf_rij )*rij_inv
+             f_tmp_iatom(:) = QiQj *( -rij_inv*( drij(:) * rij2_inv * dump_f + dump_dfdr(:) ) &
+                                      +drij(:)*rij2_inv * (erf_rij * rij_inv - coef_derfc*exp_rij) )
+
+             force_wX(:,ia_wX,imol) = force_wX(:,ia_wX,imol) + f_tmp_iatom(:)
+             force_wX(:,ja_wX,jmol) = force_wX(:,ja_wX,jmol) - f_tmp_iatom(:)
+             ene_cln = ene_cln + e_tmp
+          enddo
+          enddo
+          enddo  !ic
+       enddo   ! jmol
+
+       !! Add force coming from conformation-dependent partial charge
+       do ia= 1,natom_mol(imol)   !O,H1,H2
+          do ixyz= 1,3
+             do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
+                tmp_sumKV(ixyz,ia_wX) = sum( dKdr_wat(ixyz,ia_wX,:,ia,imol) * Vai(:,imol) )
+             enddo
+             f_tmp_iatom(ixyz) = -0.5d0* sum(tmp_sumKV(ixyz,:)*Vai(:,imol)) - sum(dQdr_wat(ixyz,:,ia,imol)*Vai(:,imol))
+          enddo
+          iatom = mol2atom_top(imol) + ia-1
+          force(:,iatom) = force(:,iatom) + f_tmp_iatom(:)
+       enddo
+
+       !! Add energy coming from sum(KabVaiVbi) term
+       e_tmp = 0d0
+       do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
+          e_tmp = e_tmp + sum(Kai(ia_wX,:,imol)*Vai(:,imol)) * Vai(ia_wX,imol)
+       enddo
+       ene_cln = ene_cln - 0.5d0*e_tmp
+
+    enddo      ! imol
+!$omp end parallel do
+
+    !! Reciprocal Space Term of Ewald
+    !call get_sumQsinGr_sumQcosGr_ewald(Rxyz_wX,Qai)
+    tmp1 = 1d0/(4d0*a_ewald*a_ewald)
+    tmp2 = 2d0*pi/L3
+!$omp parallel do &
+!$omp   private(iG,tmp_coef,e_tmp,imol,ia_wX,tmp3,tmp_c,tmp_s,f_tmp_iatom) &
+!$omp   reduction(+:force_wX,ene_cln)
+    do iG=1,nG_cmd
+       tmp_coef = tmp2 * exp(-G2(iG)*tmp1)/G2(iG)
+       e_tmp = tmp_coef * (sumQicosGri(iG)**2 + sumQisinGri(iG)**2)
+       ene_cln = ene_cln + e_tmp
+       do imol=1,nmol
+       do ia_wX=1,natom_wX_mol(imol)
+          tmp3  = sum(Gvec(:,iG)*Rxyz_wX(:,ia_wX,imol))
+          tmp_c = Qai(ia_wX,imol) * cos(tmp3)
+          tmp_s = Qai(ia_wX,imol) * sin(tmp3)
+          f_tmp_iatom(:) = 2d0 * tmp_coef * Gvec(:,iG) &
+                  * ( tmp_s * sumQicosGri(iG) - tmp_c * sumQisinGri(iG) )
+          force_wX(:,ia_wX,imol) = force_wX(:,ia_wX,imol) + f_tmp_iatom(:)
+       end do
+       end do
+    end do
+!$omp end parallel do
+
+    !! Self Term of Ewald
+    !(for the same atom)
+    ene_cln_self = 0d0
+!$omp parallel do collapse(2) &
+!$omp private(imol,ia_wX) reduction(+:ene_cln_self)
+    do imol=1,nmol
+    do ia_wX=1,natom_wX_mol(imol)
+       ene_cln_self = ene_cln_self + Qai(ia_wX,imol) * Qai(ia_wX,imol)
+    enddo
+    enddo
+!$omp end parallel do
+    ene_cln_self = -ene_cln_self * a_ewald/sqrt(pi)
+    ene_cln = ene_cln + ene_cln_self
+
+    !(for the different atoms in the same molecule)
+!$omp parallel do collapse(2) &
+!$omp private(imol,ia_wX,ja_wX,drij,rij2,rij2_inv,rij,rij_inv) &
+!$omp private(QiQj,erf_rij,exp_rij,e_tmp,f_tmp_iatom) &
+!$omp reduction(+:force_wX,ene_cln)
+    do imol=1,nmol
+       do ia_wX= 1,natom_wX_mol(imol)
+       do ja_wX= ia_wX+1,natom_wX_mol(imol)
+
+          drij(:) = Rxyz_wX(:,ja_wX,imol) - Rxyz_wX(:,ia_wX,imol)
+          rij2    = sum(drij(:)*drij(:))
+          rij     = sqrt(rij2)
+          rij2_inv= 1d0/rij2
+          rij_inv = 1d0/rij
+
+          QiQj    = Qai(ia_wX,imol) * Qai(ja_wX,imol)
+          erf_rij = erf_salmon(a_ewald*rij)
+          exp_rij = exp(-a_ewald*a_ewald*rij2)
+
+          e_tmp = -QiQj * erf_rij * rij_inv
+          f_tmp_iatom(:) = drij(:)*rij2_inv * QiQj *(erf_rij * rij_inv - coef_derfc*exp_rij) 
+
+          force_wX(:,ia_wX,imol) = force_wX(:,ia_wX,imol) + f_tmp_iatom(:)
+          force_wX(:,ja_wX,imol) = force_wX(:,ja_wX,imol) - f_tmp_iatom(:)
+          ene_cln = ene_cln + e_tmp
+       enddo
+       enddo
+    enddo
+!$omp end parallel do
+
+    ! convert from system with X atoms into ordinary real atom system
+    do imol=1,nmol
+       !force on H1,H2 (ordinary Coulomb interaction)
+       do ia= 2,3  !H1,H2
+          iatom = mol2atom_top(imol) + ia-1
+          ia_wX = ia+1
+          force(:,iatom) = force(:,iatom) + force_wX(:,ia_wX,imol)
+       enddo
+
+       ! force through X1,X2 sites in imol & jmol
+       do ia= 1,3    ! O,H1,H2 atoms in imol
+          iatom = mol2atom_top(imol) + ia-1
+          do iX= 1,2       ! X1,X2 sites in imol/jmol
+          do ixyz=1,3
+             force(ixyz,iatom) = force(ixyz,iatom) + sum(dRXdRatom(:,iX,ixyz,ia,imol)*force_wX(:,iX,imol))
+          enddo
+          enddo
+       enddo
+    enddo     ! imol
+
+
+    ene_vdw = 4d0*(eps_sgm12_vdw_wat * ene_vdw12 - eps_sgm6_vdw_wat * ene_vdw6)
+    Uene = Uene + ene_cln + ene_vdw
+
+    !!check of coulomb energy from different calculation
+    !e_tmp=0d0
+    !do imol=1,nmol
+    !do ia_wX=1,natom_wX_mol(imol)
+    !   e_tmp = e_tmp + 0.5d0*Qai(ia_wX,imol)*Vai(ia_wX,imol)
+    !enddo
+    !enddo
+    !do imol=1,nmol
+    !do ia_wX=1,natom_wX_mol(imol)
+    !do ja_wX=1,natom_wX_mol(imol)
+    !   e_tmp = e_tmp - 0.5d0*Kai(ia_wX,ja_wX,imol)*Vai(ia_wX,imol)*Vai(ja_wX,imol)
+    !enddo
+    !enddo
+    !enddo
+    !write(*,'(a,3e22.10)') "#check-coulomb-energy:", e_tmp, ene_cln, e_tmp-ene_cln
+
+!hoge
+!    !write for check 
+!    write(*,*) "------ output for check -------"
+!    do imol=1,nmol
+!    do ia=1,3
+!       iatom = mol2atom_top(imol) + ia-1
+!       write(*,5) imol,iatom,(Rion(ixyz,iatom),ixyz=1,3)
+!    enddo
+!    enddo
+!  5 format("Rion=",2i4,3e20.10)
+!    write(*,10) Uene, (Uene-ene_cln-ene_vdw), ene_vdw, ene_cln
+! 10 format("Energy=", 4e20.10)
+!    do imol=1,nmol
+!       write(*,20) imol,(Q0ai(ia_wX,imol),ia_wX=1,4)
+!    enddo
+! 20 format("Charge(Q0)=",i4,4e20.10)
+!    do imol=1,nmol
+!       write(*,25) imol,(Qai(ia_wX,imol),ia_wX=1,4)
+!    enddo
+! 25 format("Charge(Q)=",i4,4e20.10)
+!    do imol=1,nmol
+!    do ia=1,3
+!       iatom = mol2atom_top(imol) + ia-1
+!       write(*,30) imol,iatom,(force(ixyz,iatom),ixyz=1,3)
+!    enddo
+!    enddo
+! 30 format("Force=",2i4,3e20.10)
+!    write(*,*) "-------------------------------"
+!    stop
+
+  end subroutine force_energy_intermolecular_CRK
+
+!---------------------------------------------------------
+  subroutine force_energy_intermolecular_CRK_NoParallel
+    use salmon_math
+    use inputoutput, only: au_length_aa, au_energy_ev
+    implicit none
+    integer :: ia,ia_wX, ja_wX, imol,jmol, is,is_wat,index_image(3,nc_max),nc,ic
+    integer :: iatom_c, jatom_c, iatom, iter, iX, ixyz, iG
+    real(8) :: drij(3),drij0(3),rij,rij_inv,rij2,rij2_inv,rij6_inv,rij12_inv,r2_cutoff
+    real(8) :: ene_vdw,ene_vdw6,ene_vdw12,ene_cln,ene_cln_self
+    real(8) :: eps_sgm6_vdw_wat, eps_sgm12_vdw_wat
+    real(8) :: e_tmp, f_tmp, f_tmp_iatom(3), dump_f, dump_dfdr(3)
+    real(8) :: force_wX(3,4,nmol), dRXdRatom(3,2,3,3,nmol)
+    real(8) :: Qai_old(4,nmol),Q0ai(4,nmol), dQave
+    real(8) :: QiQj, dQdr_wat(3,4,3,nmol)
+    real(8) :: Kai(4,4,nmol), dKdr_wat(3,4,4,3,nmol) 
+    real(8) :: Vai(4,nmol), tmp_sumKV(3,4)
+    real(8) :: erf_rij,exp_rij, a_ewald_rij
+    real(8) :: tmp_s,tmp_c,tmp_coef,tmp1,tmp2,tmp3
+
 
     if(nmol_s.ge.2) then
        call Err_finalize("Now combination rule of vdw is not supported except for water")
@@ -542,9 +1057,10 @@ contains
        do jmol=imol+1,nmol
           jatom_c = mol2atom_cnt(jmol)
 
-          drij(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
-          call image_periodic(drij,index_image(:))
-          drij(:) = drij(:) + index_image(:)*aL(:)
+          drij0(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
+          call image_periodic(drij0,index_image,nc)
+          drij(:) = drij0(:) + index_image(:,ic)*aL(:)
+          do ic=1,nc
           rij2 = sum(drij(:)*drij(:))
           if(rij2 .gt. r2_cutoff) cycle   !cut-off
 
@@ -563,7 +1079,7 @@ contains
           !!    Real Space Term of Ewald (the other terms are after the loop)
           do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
           do ja_wX= 1,natom_wX_mol(jmol)
-             drij(:) = (Rxyz_wX(:,ja_wX,jmol) - Rxyz_wX(:,ia_wX,imol)) + index_image(:)*aL(:)
+             drij(:) = (Rxyz_wX(:,ja_wX,jmol)-Rxyz_wX(:,ia_wX,imol)) + index_image(:,ic)*aL(:)
              rij2    = sum(drij(:)*drij(:))
              rij     = sqrt(rij2)
              rij_inv = 1d0/rij
@@ -571,13 +1087,14 @@ contains
              a_ewald_rij = a_ewald * rij
              erf_rij     = erf_salmon(a_ewald_rij)
 
-             if(flag_use_dump_f) call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,0)
+             call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,0)
              tmp1 = ( dump_f - erf_rij )*rij_inv
              Vai(ia_wX,imol) = Vai(ia_wX,imol) + Qai(ja_wX,jmol) * tmp1
              Vai(ja_wX,jmol) = Vai(ja_wX,jmol) + Qai(ia_wX,imol) * tmp1
 
           enddo
           enddo
+          enddo  !ic
 
        enddo   !jmol
     enddo      !imol
@@ -646,9 +1163,10 @@ contains
        do jmol=imol+1,nmol
           jatom_c = mol2atom_cnt(jmol)
 
-          drij(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
-          call image_periodic(drij,index_image(:))
-          drij(:) = drij(:) + index_image(:)*aL(:)
+          drij0(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
+          call image_periodic(drij0,index_image,nc)
+          do ic=1,nc
+          drij(:) = drij0(:) + index_image(:,ic)*aL(:)
           rij2 = sum(drij(:)*drij(:))
           if(rij2 .gt. r2_cutoff) cycle   !cut-off
 
@@ -656,7 +1174,7 @@ contains
           !!    Real Space Term of Ewald (the other terms are after the loop)
           do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
           do ja_wX= 1,natom_wX_mol(jmol)
-             drij(:) = (Rxyz_wX(:,ja_wX,jmol) - Rxyz_wX(:,ia_wX,imol)) + index_image(:)*aL(:)
+             drij(:) = (Rxyz_wX(:,ja_wX,jmol) - Rxyz_wX(:,ia_wX,imol)) + index_image(:,ic)*aL(:)
              rij2    = sum(drij(:)*drij(:))
              rij     = sqrt(rij2)
              rij_inv = 1d0/rij
@@ -664,12 +1182,13 @@ contains
              a_ewald_rij = a_ewald * rij
              erf_rij     = erf_salmon(a_ewald_rij)
 
-             if(flag_use_dump_f) call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,0)
+             call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,0)
              tmp1 = ( dump_f - erf_rij )*rij_inv
              Vai(ia_wX,imol) = Vai(ia_wX,imol) + Qai(ja_wX,jmol) * tmp1
              Vai(ja_wX,jmol) = Vai(ja_wX,jmol) + Qai(ia_wX,imol) * tmp1
           enddo
           enddo
+          enddo  !ic
 
        enddo  !jmol
        enddo  !imol
@@ -737,9 +1256,10 @@ contains
        do jmol=imol+1,nmol
           jatom_c = mol2atom_cnt(jmol)
 
-          drij(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
-          call image_periodic(drij,index_image)
-          drij(:) = drij(:) + index_image(:)*aL(:)
+          drij0(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
+          call image_periodic(drij0,index_image,nc)
+          do ic=1,nc
+          drij(:) = drij0(:) + index_image(:,ic)*aL(:)
           rij2 = sum(drij(:)*drij(:))
           if(rij2 .gt. r2_cutoff) cycle   !cut-off
 
@@ -747,7 +1267,7 @@ contains
           !!    Real Space Term of Ewald (the other terms are after the loop)
           do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
           do ja_wX= 1,natom_wX_mol(jmol)
-             drij(:) = (Rxyz_wX(:,ja_wX,jmol) - Rxyz_wX(:,ia_wX,imol)) + index_image(:)*aL(:)
+             drij(:) = (Rxyz_wX(:,ja_wX,jmol) - Rxyz_wX(:,ia_wX,imol)) + index_image(:,ic)*aL(:)
              rij2    = sum(drij(:)*drij(:))
              rij     = sqrt(rij2)
              rij_inv = 1d0/rij
@@ -758,7 +1278,7 @@ contains
              erf_rij    = erf_salmon(a_ewald_rij)
              exp_rij     = exp(-a_ewald_rij * a_ewald_rij)
 
-             if(flag_use_dump_f) call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,1)
+             call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,1)
              e_tmp          = QiQj * ( dump_f -  erf_rij )*rij_inv
              f_tmp_iatom(:) = QiQj *( -rij_inv*( drij(:) * rij2_inv * dump_f + dump_dfdr(:) ) &
                                       +drij(:)*rij2_inv * (erf_rij * rij_inv - coef_derfc*exp_rij) )
@@ -768,24 +1288,21 @@ contains
              ene_cln = ene_cln + e_tmp
           enddo
           enddo
+          enddo  !ic
 
        enddo   ! jmol
 
        !! Add force coming from conformation-dependent partial charge
-       if(flag_use_conf_dep_chg) then
-
-          do ia= 1,natom_mol(imol)   !O,H1,H2
-             do ixyz= 1,3
-                do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
-                   tmp_sumKV(ixyz,ia_wX) = sum( dKdr_wat(ixyz,ia_wX,:,ia,imol) * Vai(:,imol) )
-                enddo
-                f_tmp_iatom(ixyz) = -0.5d0* sum(tmp_sumKV(ixyz,:)*Vai(:,imol)) - sum(dQdr_wat(ixyz,:,ia,imol)*Vai(:,imol))
+       do ia= 1,natom_mol(imol)   !O,H1,H2
+          do ixyz= 1,3
+             do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
+                tmp_sumKV(ixyz,ia_wX) = sum( dKdr_wat(ixyz,ia_wX,:,ia,imol) * Vai(:,imol) )
              enddo
-             iatom = mol2atom_top(imol) + ia-1
-             force(:,iatom) = force(:,iatom) + f_tmp_iatom(:)
+             f_tmp_iatom(ixyz) = -0.5d0* sum(tmp_sumKV(ixyz,:)*Vai(:,imol)) - sum(dQdr_wat(ixyz,:,ia,imol)*Vai(:,imol))
           enddo
-
-       endif
+          iatom = mol2atom_top(imol) + ia-1
+          force(:,iatom) = force(:,iatom) + f_tmp_iatom(:)
+       enddo
 
        !! Add energy coming from sum(KabVaiVbi) term
        e_tmp = 0d0
@@ -922,687 +1439,45 @@ contains
 !    write(*,*) "-------------------------------"
 !    stop
 
-  end subroutine force_energy_intermolecular_CRK
+  end subroutine force_energy_intermolecular_CRK_NoParallel
 
 !---------------------------------------------------------
-  subroutine force_energy_intermolecular_CRK_simple
-    use salmon_math
-    use inputoutput, only: au_length_aa, au_energy_ev
+
+  subroutine image_periodic(drij,idx,nc)
     implicit none
-    integer :: ia,ia_wX, ja_wX, imol,jmol, is,is_wat,index_image(3)
-    integer :: iatom_c, jatom_c, iatom, jatom
-    integer :: iter, iter_max, iX, ixyz  !iG
-    real(8) :: drij(3), rij,rij_inv,rij2,rij2_inv,rij6_inv,rij12_inv,r2_cutoff
-    real(8) :: ene_vdw,ene_vdw6,ene_vdw12,ene_cln!ene_cln_self
-    real(8) :: eps_sgm6_vdw_wat, eps_sgm12_vdw_wat
-    real(8) :: e_tmp, f_tmp, f_tmp_iatom(3), dump_f, dump_dfdr(3)
-    real(8) :: Rxyz_wX(3,4,nmol), dRXdRatom(3,2,3,3,nmol)   
-    real(8) :: F_imol_withX(3,5), F_jmol_withX(3,5)
-    real(8) :: Qi,Qj, dQdr_wat(3,4,3,nmol),Qai_old(4,nmol),Q0ai(4,nmol), dQave
-    real(8) :: Kai(4,4,nmol),dKdr_wat(3,4,4,3,nmol), Vai(4,nmol), tmp_sumKV(3,4)
-!    real(8) :: Rxyz_imol(3,3),dK_wat(4,4,nmol),dQ_wat(4,nmol),S123(3),dSdr(3,3,3)
-!    real(8) :: erfc_rij, exp_rij, QiQj, a_ewald_rij
-!    real(8) :: tmp_s,tmp_c,tmp_coef,tmp1,tmp2
-
-
-    if(.not. flag_use_Xatoms ) then
-       call Err_finalize("Error: flag_use_Xatoms=false is not supported")
-       stop
-    endif
-
-    if(nmol_s.ge.2) then
-       call Err_finalize("Now combination rule of vdw is not supported except for water")
-       stop
-    endif
-
-    dQave_thresh = 1d-7 ![au]
-    iter_max     = 20
-
-    !for water (oxygen)
-    do imol=1,nmol
-       is = mol2species(imol)
-       if(name_mol_s(is)=="WAT"   .or. &
-          name_mol_s(is)=="WATER" .or. &
-          name_mol_s(is)=="Water" .or. &
-          name_mol_s(is)=="water" ) then
-          is_wat = is
-          ia = mol2atom_top(imol)
-          eps_sgm6_vdw_wat = eps_vdw(ia) * sgm_vdw(ia)**6d0
-          eps_sgm12_vdw_wat= eps_vdw(ia) * sgm_vdw(ia)**12d0
-          exit
-        endif
-    enddo
-
-    r2_cutoff = r_cutoff * r_cutoff
-
-
-    !generate X sites for each water molecules
-    call get_Xatom_wat(Rxyz_wX,dRXdRatom)
-
-    !get Q0 and Kai
-    call get_Q0_K_wat( Q0ai,dQdr_wat,Kai,dKdr_wat,is_wat )
-
-!    !calculate conformation-dependent partial charge
-!    if(flag_use_conf_dep_chg) then
-!       do imol=1,nmol
-!          do ia=1,natom_mol(imol)
-!             iatom = mol2atom_top(imol)-1  + ia
-!             Rxyz_imol(:,ia) = Rion(:,iatom)
-!          enddo
-!          call get_conf_dependent_matrix_wat( Rxyz_imol,is_wat,S123,dSdr)
-!
-!          !correction of Kai and dK/dr = dKdS * dS/dr
-!          do ia_wX=1,4   !X1,X2,H1,H2
-!          do ja_wX=1,4   !X1,X2,H1,H2
-!             dK_wat(ia_wX,ja_wX,imol) = sum(dKdS_wat(ia_wX,ja_wX,:)*S123(:))
-!             do ia=1,3   !O,H1,H2
-!             do ixyz=1,3 !x,y,z
-!                dKdr_wat(ixyz,ia_wX,ja_wX,ia,imol) = sum( dKdS_wat(ia_wX,ja_wX,:)*dSdr(ixyz,:,ia) )
-!             enddo
-!             enddo
-!          enddo
-!          enddo
-!          Kai(:,:,imol) = Keq_wat(:,:) + dK_wat(:,:,imol)
-!
-!          !correction of Q0 and dQ/dr = dQdS * dS/dr
-!          do ia_wX=1,4   !X1,X2,H1,H2
-!             dQ_wat(ia_wX,imol) = sum(dQdS_wat(ia_wX,:)*S123(:))
-!             do ia=1,3   !O,H1,H2
-!             do ixyz=1,3 !x,y,z
-!                dQdr_wat(ixyz,ia_wX,ia,imol) = sum( dQdS_wat(ia_wX,:)*dSdr(ixyz,:,ia) )
-!             enddo
-!             enddo
-!          enddo
-!          Q0ai(:,imol) = Qeq_withX_wat(:) + dQ_wat(:,imol)
-!
-!       enddo
-!    else
-!       dQ_wat(:,:) = 0d0
-!    endif
-    
-    ene_vdw6  = 0d0
-    ene_vdw12 = 0d0
-    ene_cln   = 0d0
-
-    dump_f       = 1d0
-    dump_dfdr(:) = 0d0
-
-    Vai(:,:) = 0d0
-   !Qai(:,:) = Q0ai(:,:)
-
-    do imol=1,nmol
-       iatom_c = mol2atom_cnt(imol)
-       do jmol=imol+1,nmol
-          jatom_c = mol2atom_cnt(jmol)
-
-          drij(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
-          call image_periodic(drij,index_image(:))
-          drij(:) = drij(:) + index_image(:)*aL(:)
-          rij2 = sum(drij(:)*drij(:))
-          if(rij2 .gt. r2_cutoff) cycle   !cut-off
-
-          !! VDW interaction (water, only between oxygen atoms)
-          rij2_inv = 1d0/rij2
-          rij6_inv = rij2_inv*rij2_inv*rij2_inv
-          rij12_inv= rij6_inv*rij6_inv
-          ene_vdw6  = ene_vdw6  + rij6_inv
-          ene_vdw12 = ene_vdw12 + rij12_inv
-          f_tmp = 2d0*eps_sgm12_vdw_wat*rij12_inv - eps_sgm6_vdw_wat*rij6_inv
-          f_tmp_iatom(:) = -f_tmp * 24d0 * rij2_inv * drij(:)
-          force(:,iatom_c) = force(:,iatom_c) + f_tmp_iatom(:)
-          force(:,jatom_c) = force(:,jatom_c) - f_tmp_iatom(:)
-
-          !! Coulomb interaction  Here, just get Vabi before iteration
-          if(flag_use_ewald_cln)then  
-          !!--- Ewald method ---
-          !!    Real Space Term of Ewald (the other terms are after the loop)
-                ! (under construction)
-
-          else  
-          !!--- Simple cut-off coulomb interaction ---
-             !! Coulomb using X sites (correct CRK scheme)
-
-             do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
-             do ja_wX= 1,natom_wX_mol(jmol)
-                drij(:) = (Rxyz_wX(:,ja_wX,jmol) - Rxyz_wX(:,ia_wX,imol)) + index_image(:)*aL(:)
-                rij2    = sum(drij(:)*drij(:))
-                rij     = sqrt(rij2)
-                rij_inv = 1d0/rij
-
-                if(flag_use_dump_f) call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,0)
-                Vai(ia_wX,imol) = Vai(ia_wX,imol) + Qai(ja_wX,jmol) * rij_inv * dump_f
-                Vai(ja_wX,jmol) = Vai(ja_wX,jmol) + Qai(ia_wX,imol) * rij_inv * dump_f
-
-             enddo
-             enddo
-
-          endif  !flag_use_ewald_cln
-
-       enddo
-    enddo
-
-    !! Iteration for Coulomb
-    do iter=1,iter_max
-
-       !get charge Qai using Vai
-       Qai_old(:,:) = Qai(:,:)
-       dQave = 0d0
-       do imol=1,nmol
-       do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
-          Qai(ia_wX,imol) = Q0ai(ia_wX,imol) + sum( Kai(ia_wX,:,imol)*Vai(:,imol) )
-          dQave = dQave + ( Qai(ia_wX,imol) - Qai_old(ia_wX,imol) )**2
-       enddo
-       enddo
-       dQave = sqrt( dQave/NI_wX )
-
-       !get Vai using Qai
-       Vai(:,:) = 0d0
-       do imol=1,nmol
-          iatom_c = mol2atom_cnt(imol)
-       do jmol=imol+1,nmol
-          jatom_c = mol2atom_cnt(jmol)
-
-          drij(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
-          call image_periodic(drij,index_image(:))
-          drij(:) = drij(:) + index_image(:)*aL(:)
-          rij2 = sum(drij(:)*drij(:))
-          if(rij2 .gt. r2_cutoff) cycle   !cut-off
-
-          if(flag_use_ewald_cln)then  
-          !!--- Ewald method ---
-          !!    Real Space Term of Ewald (the other terms are after the loop)
-                ! (under construction)
-
-          else  
-          !!--- Simple cut-off coulomb interaction ---
-             do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
-             do ja_wX= 1,natom_wX_mol(jmol)
-
-                drij(:) = (Rxyz_wX(:,ja_wX,jmol) - Rxyz_wX(:,ia_wX,imol)) + index_image(:)*aL(:)
-                rij2    = sum(drij(:)*drij(:))
-                rij     = sqrt(rij2)
-                rij_inv = 1d0/rij
-
-                if(flag_use_dump_f) call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,0)
-                Vai(ia_wX,imol) = Vai(ia_wX,imol) + Qai(ja_wX,jmol) * rij_inv * dump_f
-                Vai(ja_wX,jmol) = Vai(ja_wX,jmol) + Qai(ia_wX,imol) * rij_inv * dump_f
-
-             enddo
-             enddo
-
-          endif  !flag_use_ewald_cln
-
-       enddo  !jmol
-       enddo  !imol
-
-       !check convergence
-       if(dQave .le. dQave_thresh) then
-          if (comm_is_root(nproc_id_global)) &
-          write(*,*) "#Qai is converged: dQave=", dQave, iter
-          exit
-       else if(iter == iter_max) then
-          if (comm_is_root(nproc_id_global)) &
-          write(*,*) "#iter=iter_max: not converged", dQave, iter
-       endif
-
-    enddo  !iter
-
-    ! calculate energy and focer of Coulomb interaction after convergence
-    do imol=1,nmol
-       iatom_c = mol2atom_cnt(imol)
-       do jmol=imol+1,nmol
-          jatom_c = mol2atom_cnt(jmol)
-
-          drij(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
-          call image_periodic(drij,index_image)
-          drij(:) = drij(:) + index_image(:)*aL(:)
-          rij2 = sum(drij(:)*drij(:))
-          if(rij2 .gt. r2_cutoff) cycle   !cut-off
-
-          !! Coulomb interaction 
-          if(flag_use_ewald_cln)then  
-          !!--- Ewald method ---
-          !!    Real Space Term of Ewald (the other terms are after the loop)
-             ! (under construction)
-
-          else  
-          !!--- Simple cut-off coulomb interaction ---
-
-             !! Coulomb using X sites (correct CRK scheme)
-
-             F_imol_withX(:,:) = 0d0
-             F_jmol_withX(:,:) = 0d0
-
-             do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
-             do ja_wX= 1,natom_wX_mol(jmol)
-                   
-                drij(:) = (Rxyz_wX(:,ja_wX,jmol) - Rxyz_wX(:,ia_wX,imol)) + index_image(:)*aL(:)
-                rij2    = sum(drij(:)*drij(:))
-                rij     = sqrt(rij2)
-                rij2_inv= 1d0/rij2
-                rij_inv = 1d0/rij
-
-                Qi = Qai(ia_wX,imol)
-                Qj = Qai(ja_wX,jmol)
-                e_tmp  = Qi * Qj * rij_inv
-                f_tmp_iatom(:) = -e_tmp * rij2_inv * drij(:)
-
-                !(correction by gaussian distribution of charge)
-                if(flag_use_dump_f) then
-                   call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,1)
-                   f_tmp_iatom(:) = f_tmp_iatom(:) * dump_f - dump_dfdr(:) * e_tmp
-                   e_tmp = e_tmp * dump_f
-                endif
-
-                F_imol_withX(:,ia_wX) = F_imol_withX(:,ia_wX) + f_tmp_iatom(:)
-                F_jmol_withX(:,ja_wX) = F_jmol_withX(:,ja_wX) - f_tmp_iatom(:)
-                ene_cln = ene_cln + e_tmp
-             enddo
-             enddo
-
-             !force on H1,H2 in imol from jmol & in jmol from imol (ordinary Coulomb interaction)
-             do ia= 2,3  !H1,H2
-                iatom = mol2atom_top(imol) + ia-1
-                jatom = mol2atom_top(jmol) + ia-1
-                ia_wX = ia+1
-                force(:,iatom) = force(:,iatom) + F_imol_withX(:,ia_wX)
-                force(:,jatom) = force(:,jatom) + F_jmol_withX(:,ia_wX)
-             enddo
-
-             ! force through X1,X2 sites in imol & jmol
-             do ia= 1,3    ! O,H1,H2 atoms in imol/jmol
-                iatom = mol2atom_top(imol) + ia-1
-                jatom = mol2atom_top(jmol) + ia-1
-                do iX= 1,2       ! X1,X2 sites in imol/jmol
-                do ixyz=1,3
-                   force(ixyz,iatom) = force(ixyz,iatom) + sum(F_imol_withX(:,iX)*dRXdRatom(:,iX,ixyz,ia,imol))
-                   force(ixyz,jatom) = force(ixyz,jatom) + sum(F_jmol_withX(:,iX)*dRXdRatom(:,iX,ixyz,ia,jmol))
-                enddo
-                enddo
-             enddo
-
-          endif  !flag_use_ewald_cln
-
-       enddo   ! jmol
-
-       !! Add force coming from conformation-dependent partial charge
-       if( flag_use_conf_dep_chg) then
-
-          do ia= 1,natom_mol(imol)   !O,H1,H2
-             do ixyz= 1,3
-                do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
-                   tmp_sumKV(ixyz,ia_wX) = sum( dKdr_wat(ixyz,ia_wX,:,ia,imol) * Vai(:,imol) )
-                enddo
-                f_tmp_iatom(ixyz) = -0.5d0* sum(tmp_sumKV(ixyz,:) * Vai(:,imol)) - sum(dQdr_wat(ixyz,:,ia,imol) * Vai(:,imol))
-             enddo
-             iatom = mol2atom_top(imol) + ia-1
-             force(:,iatom) = force(:,iatom) + f_tmp_iatom(:)
-          enddo
-
-       endif
-
-       !! Add energy coming from sum(KabVaiVbi) term
-       e_tmp = 0d0
-       do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
-          e_tmp = e_tmp + sum(Kai(ia_wX,:,imol)*Vai(:,imol)) * Vai(ia_wX,imol)
-       enddo
-       ene_cln = ene_cln - 0.5d0*e_tmp
-
-    enddo      ! imol
-
-
-    if(flag_use_ewald_cln)then
-       !! Reciprocal Space Term of Ewald
-       ! (under construction)
-       !! Self Term of Ewald
-       ! (under construction)
-    endif
-
-
-    ene_vdw = 4d0*(eps_sgm12_vdw_wat * ene_vdw12 - eps_sgm6_vdw_wat * ene_vdw6)
-    Uene = Uene + ene_cln + ene_vdw
-
-  end subroutine force_energy_intermolecular_CRK_simple
-
-!---------------------------------------------------------
-  subroutine force_energy_intermolecular_CRK_practice
-    use salmon_math
-    use inputoutput, only: au_length_aa, au_energy_ev
-    implicit none
-    integer :: ia,ja,ia_wX, ja_wX, imol,jmol, is,is_wat,index_image(3)
-    integer :: iatom_c, jatom_c, iatom, jatom
-    integer :: iX, ixyz, iG
-    real(8) :: drij(3), rij,rij_inv,rij2,rij2_inv,rij6_inv,rij12_inv,r2_cutoff
-    real(8) :: ene_vdw,ene_vdw6,ene_vdw12,ene_cln,ene_cln_self
-    real(8) :: eps_sgm6_vdw_wat, eps_sgm12_vdw_wat
-    real(8) :: e_tmp, f_tmp, f_tmp_iatom(3), dump_f, dump_dfdr(3)
-    real(8) :: Rxyz_wX(3,4,nmol), F_imol_withX(3,5), F_jmol_withX(3,5)
-    real(8) :: Rxyz_imol(3,3), dRXdRatom(3,2,3,3,nmol)
-    real(8) :: Q0i,Q0j,dQ_wat(4,nmol), dQdr_wat(3,4,3,nmol), S123(3),dSdr(3,3,3)
-    real(8) :: F_imol_corr_conf_dep(3,3), F_jmol_corr_conf_dep(3,3)
-    real(8) :: erfc_rij,erf_rij, exp_rij, QiQj, a_ewald_rij
-    real(8) :: tmp_s,tmp_c,tmp_coef,tmp1,tmp2
-
-    if(nmol_s.ge.2) then
-       call Err_finalize("Now combination rule of vdw is not supported except for water")
-       stop
-    endif
-
-    !for water (oxygen)
-    do imol=1,nmol
-       is = mol2species(imol)
-       if(name_mol_s(is)=="WAT"   .or. &
-          name_mol_s(is)=="WATER" .or. &
-          name_mol_s(is)=="Water" .or. &
-          name_mol_s(is)=="water" ) then
-          is_wat = is
-          ia = mol2atom_top(imol)
-          eps_sgm6_vdw_wat = eps_vdw(ia) * sgm_vdw(ia)**6d0
-          eps_sgm12_vdw_wat= eps_vdw(ia) * sgm_vdw(ia)**12d0
-
-          exit
-        endif
-    enddo
-
-    r2_cutoff = r_cutoff * r_cutoff
-
-    !calculate conformation-dependent partial charge
-    if(flag_use_Xatoms)then
-
-       !generate X sites for each water molecules
-       call get_Xatom_wat(Rxyz_wX,dRXdRatom)
-
-       if(flag_use_conf_dep_chg) then
-          do imol=1,nmol
-             do ia=1,natom_mol(imol)
-                iatom = mol2atom_top(imol)-1  + ia
-                Rxyz_imol(:,ia) = Rion(:,iatom)
-             enddo
-             call get_conf_dependent_matrix_wat( Rxyz_imol,is_wat,S123,dSdr)
-             !correction of partial charge and dQ/dr = dQdS * dS/dr
-             do ia_wX=1,4   !X1,X2,H1,H2
-                dQ_wat(ia_wX,imol) = sum(dQdS_wat(ia_wX,:)*S123(:))
-                do ia=1,3   !O,H1,H2
-                do ixyz=1,3 !x,y,z
-                   dQdr_wat(ixyz,ia_wX,ia,imol) = sum( dQdS_wat(ia_wX,:)*dSdr(ixyz,:,ia) )
-                enddo
-                enddo
-             enddo
-
-          enddo
-       else
-          dQ_wat(:,:) = 0d0
-       endif
-    endif
-
-    if(flag_use_ewald_cln) call get_sumQsinGr_sumQcosGr_ewald_wo_Xatom
-
-
-    ene_vdw6  = 0d0
-    ene_vdw12 = 0d0
-    ene_cln   = 0d0
-
-    dump_f       = 1d0
-    dump_dfdr(:) = 0d0
-
-    do imol=1,nmol
-       iatom_c = mol2atom_cnt(imol)
-       do jmol=imol+1,nmol
-          jatom_c = mol2atom_cnt(jmol)
-
-          drij(:) = Rion(:,jatom_c) - Rion(:,iatom_c)
-          call image_periodic(drij,index_image)
-          drij(:) = drij(:) + index_image(:)*aL(:)
-          rij2 = sum(drij(:)*drij(:))
-          if(rij2 .gt. r2_cutoff) cycle   !cut-off
-
-          !! VDW interaction (water, only between oxygen atoms)
-          rij2_inv = 1d0/rij2
-          rij6_inv = rij2_inv*rij2_inv*rij2_inv
-          rij12_inv= rij6_inv*rij6_inv
-          ene_vdw6  = ene_vdw6  + rij6_inv
-          ene_vdw12 = ene_vdw12 + rij12_inv
-          f_tmp = 2d0*eps_sgm12_vdw_wat*rij12_inv - eps_sgm6_vdw_wat*rij6_inv
-          f_tmp_iatom(:) = -f_tmp * 24d0 * rij2_inv * drij(:)
-          force(:,iatom_c) = force(:,iatom_c) + f_tmp_iatom(:)
-          force(:,jatom_c) = force(:,jatom_c) - f_tmp_iatom(:)
-
-          !! Coulomb interaction 
-          if(flag_use_ewald_cln)then  
-          !!--- Ewald method ---
-          !!    Real Space Term of Ewald (the other terms are after the loop)
-             if(flag_use_Xatoms )then
-                ! (under construction)
-             else
-
-                do ia= 1,natom_mol(imol)
-                   iatom = mol2atom_top(imol) + ia-1
-                   do ja= 1,natom_mol(jmol)
-                      jatom = mol2atom_top(jmol) + ja-1
-                   
-                      drij(:) = (Rion(:,jatom) - Rion(:,iatom)) + index_image(:)*aL(:)
-                      rij2    = sum(drij(:)*drij(:))
-                      rij     = sqrt(rij2)
-                      rij2_inv= 1d0/rij2
-                      rij_inv = 1d0/rij
-
-                      a_ewald_rij = a_ewald * rij
-                      erfc_rij = erfc_salmon(a_ewald_rij)
-                      exp_rij  = exp(-a_ewald_rij * a_ewald_rij)
-                      QiQj     = Qeq(iatom) * Qeq(jatom)
-
-                      e_tmp = QiQj * erfc_rij * rij_inv
-                      f_tmp_iatom(:) = -drij(:)*rij2_inv * QiQj *(erfc_rij * rij_inv + coef_derfc*exp_rij) 
-
-                     !!(correction by gaussian distribution of charge)
-                     !if(flag_use_dump_f) then
-                     !   call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,1)
-                     !   f_tmp_iatom(:) = f_tmp_iatom(:) * dump_f - dump_dfdr(:) * e_tmp
-                     !   e_tmp = e_tmp * dump_f
-                     !endif
-
-                      !(update force and energy)
-                      force(:,iatom) = force(:,iatom) + f_tmp_iatom(:)
-                      force(:,jatom) = force(:,jatom) - f_tmp_iatom(:)
-                      ene_cln = ene_cln + e_tmp
-                   enddo
-                enddo
-
-             endif  !flag_use_Xatoms
-
-          else  
-          !!--- Simple cut-off coulomb interaction ---
-             if(flag_use_Xatoms )then
-                !! Coulomb using X sites (correct CRK scheme)
-
-                F_imol_withX(:,:) = 0d0
-                F_jmol_withX(:,:) = 0d0
-                F_imol_corr_conf_dep(:,:) =0d0
-                F_jmol_corr_conf_dep(:,:) =0d0
-
-                do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
-                   do ja_wX= 1,natom_wX_mol(jmol)
-                   
-                      drij(:) = (Rxyz_wX(:,ja_wX,jmol) - Rxyz_wX(:,ia_wX,imol)) + index_image(:)*aL(:)
-                      rij2    = sum(drij(:)*drij(:))
-                      rij     = sqrt(rij2)
-                      rij2_inv= 1d0/rij2
-                      rij_inv = 1d0/rij
-
-                      Q0i = Qeq_withX_wat(ia_wX) + dQ_wat(ia_wX,imol)
-                      Q0j = Qeq_withX_wat(ja_wX) + dQ_wat(ja_wX,jmol)
-                      e_tmp  = Q0i * Q0j * rij_inv
-                      f_tmp_iatom(:) = -e_tmp * rij2_inv * drij(:)
-
-                      !(correction by gaussian distribution of charge)
-                      if(flag_use_dump_f) then
-                         call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,1)
-                         f_tmp_iatom(:) = f_tmp_iatom(:) * dump_f - dump_dfdr(:) * e_tmp
-                         e_tmp = e_tmp * dump_f
-                      endif
-
-                      !(correction by conformation-dependent partial charge)
-                      if( flag_use_conf_dep_chg) then
-                         do ia= 1,natom_mol(imol)   !O,H1,H2
-                            F_imol_corr_conf_dep(:,ia)= F_imol_corr_conf_dep(:,ia)- dQdr_wat(:,ia_wX,ia,imol)* Q0j* rij_inv *dump_f
-                         enddo
-                         do ja= 1,natom_mol(jmol)
-                            F_jmol_corr_conf_dep(:,ja)= F_jmol_corr_conf_dep(:,ja)- dQdr_wat(:,ja_wX,ja,jmol)* Q0i* rij_inv *dump_f
-                         enddo
-                      endif
-
-                      F_imol_withX(:,ia_wX) = F_imol_withX(:,ia_wX) + f_tmp_iatom(:)
-                      F_jmol_withX(:,ja_wX) = F_jmol_withX(:,ja_wX) - f_tmp_iatom(:)
-                      ene_cln = ene_cln + e_tmp
-                   enddo
-                enddo
-
-                !force on H1,H2 in imol from jmol & in jmol from imol (ordinary Coulomb interaction)
-                do ia= 2,3  !H1,H2
-                   iatom = mol2atom_top(imol) + ia-1
-                   jatom = mol2atom_top(jmol) + ia-1
-                   ia_wX = ia+1
-                   force(:,iatom) = force(:,iatom) + F_imol_withX(:,ia_wX)
-                   force(:,jatom) = force(:,jatom) + F_jmol_withX(:,ia_wX)
-                enddo
-
-                ! force through X1,X2 sites in imol & jmol
-                do ia= 1,3    ! O,H1,H2 atoms in imol/jmol
-                   iatom = mol2atom_top(imol) + ia-1
-                   jatom = mol2atom_top(jmol) + ia-1
-                   do iX= 1,2       ! X1,X2 sites in imol/jmol
-                   do ixyz=1,3
-                      force(ixyz,iatom) = force(ixyz,iatom) + sum(F_imol_withX(:,iX)*dRXdRatom(:,iX,ixyz,ia,imol))
-                      force(ixyz,jatom) = force(ixyz,jatom) + sum(F_jmol_withX(:,iX)*dRXdRatom(:,iX,ixyz,ia,jmol))
-                   enddo
-                   enddo
-                enddo
-
-                !correction by conformation-dependent partial charge
-                if( flag_use_conf_dep_chg) then
-                   do ia= 1,3    ! O,H1,H2 atoms in jmol
-                      iatom = mol2atom_top(imol) + ia-1
-                      jatom = mol2atom_top(jmol) + ia-1
-                      force(:,iatom) = force(:,iatom) + F_imol_corr_conf_dep(:,ia)
-                      force(:,jatom) = force(:,jatom) + F_jmol_corr_conf_dep(:,ia)
-                   enddo
-                endif
-
-             else
-                !! Simple Coulomb interaction not using X sites for test)
-                do ia= 1,natom_mol(imol)
-                   iatom = mol2atom_top(imol) + ia-1
-                   do ja= 1,natom_mol(jmol)
-                      jatom = mol2atom_top(jmol) + ja-1
-                   
-                      drij(:) = (Rion(:,jatom) - Rion(:,iatom)) + index_image(:)*aL(:)
-                      rij2    = sum(drij(:)*drij(:))
-                      rij     = sqrt(rij2)
-                      rij2_inv= 1d0/rij2
-                      rij_inv = 1d0/rij
-
-                      e_tmp = Qeq(iatom) * Qeq(jatom) * rij_inv 
-                      f_tmp_iatom(:) = -e_tmp * rij2_inv * drij(:)
-
-                      !(correction by gaussian distribution of charge)
-                      if(flag_use_dump_f) then
-                         call get_dump_f(dump_f,dump_dfdr,rij,rij2,rij_inv,drij,1)
-                         f_tmp_iatom(:) = f_tmp_iatom(:) * dump_f - dump_dfdr(:) * e_tmp
-                         e_tmp = e_tmp * dump_f
-                      endif
-
-                      !(update force and energy)
-                      force(:,iatom) = force(:,iatom) + f_tmp_iatom(:)
-                      force(:,jatom) = force(:,jatom) - f_tmp_iatom(:)
-                      ene_cln = ene_cln + e_tmp
-                   enddo
-                enddo
-
-             endif  !flag_use_Xatoms
-
-          endif  !flag_use_ewald_cln
-
-       enddo
-    enddo
-
-    if(flag_use_ewald_cln)then
-       !! Reciprocal Space Term of Ewald
-       tmp1 = 1d0/(4d0*a_ewald*a_ewald)
-       tmp2 = 2d0*pi/L3
-       do iG=1,nG_cmd
-          tmp_coef = tmp2 * exp(-G2(iG)*tmp1)/G2(iG)
-          e_tmp = tmp_coef * (sumQicosGri(iG)**2 + sumQisinGri(iG)**2)
-          ene_cln = ene_cln + e_tmp
-          do ia=1,NI
-             tmp_c = Qeq(ia) * cos(sum(Gvec(:,iG)*Rion(:,ia)))
-             tmp_s = Qeq(ia) * sin(sum(Gvec(:,iG)*Rion(:,ia)))
-             f_tmp_iatom(:) = 2d0 * tmp_coef * Gvec(:,iG) &
-                  * ( tmp_s * sumQicosGri(iG) - tmp_c * sumQisinGri(iG) )
-             force(:,ia) = force(:,ia) + f_tmp_iatom(:)
-          end do
-       end do
-       
-       !! Self Term of Ewald
-       !(for the same atom)
-       ene_cln_self = 0d0
-       do ia= 1,NI
-          ene_cln_self = ene_cln_self + Qeq(iatom) * Qeq(iatom)
-       enddo
-       ene_cln_self = -ene_cln_self * a_ewald/sqrt(pi)
-       ene_cln = ene_cln + ene_cln_self
-
-       !(for the different atoms in the same molecule)
-       do imol=1,nmol
-          do ia= 1,natom_mol(imol)
-             iatom = mol2atom_top(imol) + ia-1
-             do ja= ia+1,natom_mol(imol)
-                jatom = mol2atom_top(imol) + ja-1
-
-                drij(:) = Rion(:,jatom) - Rion(:,iatom)
-                rij2    = sum(drij(:)*drij(:))
-                rij     = sqrt(rij2)
-                rij2_inv= 1d0/rij2
-                rij_inv = 1d0/rij
-
-                erf_rij  = erf_salmon(a_ewald*rij)
-                exp_rij  = exp(-a_ewald*a_ewald*rij2)
-                QiQj = Qeq(iatom) * Qeq(jatom)
-
-                e_tmp = -QiQj * erf_rij * rij_inv
-                f_tmp_iatom(:) = drij(:)*rij2_inv * QiQj *(erf_rij * rij_inv - coef_derfc*exp_rij) 
-
-                force(:,iatom) = force(:,iatom) + f_tmp_iatom(:)
-                force(:,jatom) = force(:,jatom) - f_tmp_iatom(:)
-                ene_cln = ene_cln + e_tmp
-
-             enddo
-          enddo
-       enddo
-
-    endif
-
-
-    ene_vdw = 4d0*(eps_sgm12_vdw_wat * ene_vdw12 - eps_sgm6_vdw_wat * ene_vdw6)
-    Uene = Uene + ene_cln + ene_vdw
-
-  end subroutine force_energy_intermolecular_CRK_practice
-
-
-  subroutine image_periodic(drij,ipzm_min)
-    implicit none
-    integer :: j, ipzm, ipzm_min(3)
+    integer :: j, ipzm,idx(3,nc_max),ipzm_min(3), nc,icx,icy,icz
     real(8) :: tmp_min, drij(3), dist !, drij_new(3)
 
-    do j=1,3
-       tmp_min = 1d99
-       do ipzm=-1,1
-          dist = abs( drij(j) + ipzm * aL(j) )
-          if( dist .le. tmp_min) then
-             tmp_min     = dist
-             ipzm_min(j) = ipzm
-          endif
+    if(flag_use_over_cell)then
+       !when cut-off radius is larger than half of cell size
+       nc = 0
+       do icx= -ncell_max(1),ncell_max(1)
+       do icy= -ncell_max(2),ncell_max(2)
+       do icz= -ncell_max(3),ncell_max(3)
+          nc = nc+1
+          idx(1,nc) = icx
+          idx(2,nc) = icy
+          idx(3,nc) = icz
        enddo
-    enddo
+       enddo
+       enddo
+
+    else
+       !when cut-off radius is smaller than half of cell size
+       nc=1
+       do j=1,3
+          tmp_min = 1d99
+          do ipzm=-1,1
+             dist = abs( drij(j) + ipzm * aL(j) )
+             if( dist .le. tmp_min) then
+                tmp_min     = dist
+                ipzm_min(j) = ipzm
+             endif
+          enddo
+       enddo
+       idx(:,nc) = ipzm_min(:)
+
+    endif
 
   end subroutine
 
@@ -1733,53 +1608,37 @@ contains
     real(8) :: Kai(4,4,nmol),dK_wat(4,4,nmol),dKdr_wat(3,4,4,3,nmol)
     real(8) :: S123(3),dSdr(3,3,3)
 
-    if(flag_use_conf_dep_chg) then
-
-       do imol=1,nmol
-          do ia=1,natom_mol(imol)
-             iatom = mol2atom_top(imol)-1  + ia
-             Rxyz_imol(:,ia) = Rion(:,iatom)
-          enddo
-          call get_conf_dependent_matrix_wat( Rxyz_imol,is_wat,S123,dSdr )
-
-          !correction of Kai and dK/dr = dKdS * dS/dr
-          do ia_wX=1,4   !X1,X2,H1,H2
-          do ja_wX=1,4   !X1,X2,H1,H2
-             dK_wat(ia_wX,ja_wX,imol) = sum(dKdS_wat(ia_wX,ja_wX,:)*S123(:))
-             do ia=1,3   !O,H1,H2
-             do ixyz=1,3 !x,y,z
-                dKdr_wat(ixyz,ia_wX,ja_wX,ia,imol) = sum( dKdS_wat(ia_wX,ja_wX,:)*dSdr(ixyz,:,ia) )
-             enddo
-             enddo
-          enddo
-          enddo
-          Kai(:,:,imol) = Keq_wat(:,:) + dK_wat(:,:,imol)
-
-          !correction of Q0 and dQ/dr = dQdS * dS/dr
-          do ia_wX=1,4   !X1,X2,H1,H2
-             dQ_wat(ia_wX,imol) = sum(dQdS_wat(ia_wX,:)*S123(:))
-             do ia=1,3   !O,H1,H2
-             do ixyz=1,3 !x,y,z
-                dQdr_wat(ixyz,ia_wX,ia,imol) = sum( dQdS_wat(ia_wX,:)*dSdr(ixyz,:,ia) )
-             enddo
-             enddo
-          enddo
-          Q0ai(:,imol) = Qeq_withX_wat(:) + dQ_wat(:,imol)
+    do imol=1,nmol
+       do ia=1,natom_mol(imol)
+          iatom = mol2atom_top(imol)-1  + ia
+          Rxyz_imol(:,ia) = Rion(:,iatom)
        enddo
+       call get_conf_dependent_matrix_wat( Rxyz_imol,is_wat,S123,dSdr )
 
-    else
-
-       do imol=1,nmol
-          Q0ai(:,imol) = Qeq_withX_wat(:)
+       !correction of Kai and dK/dr = dKdS * dS/dr
+       do ia_wX=1,4   !X1,X2,H1,H2
+       do ja_wX=1,4   !X1,X2,H1,H2
+          dK_wat(ia_wX,ja_wX,imol) = sum(dKdS_wat(ia_wX,ja_wX,:)*S123(:))
+          do ia=1,3   !O,H1,H2
+          do ixyz=1,3 !x,y,z
+             dKdr_wat(ixyz,ia_wX,ja_wX,ia,imol) = sum( dKdS_wat(ia_wX,ja_wX,:)*dSdr(ixyz,:,ia) )
+          enddo
+          enddo
        enddo
+       enddo
+       Kai(:,:,imol) = Keq_wat(:,:) + dK_wat(:,:,imol)
 
-    endif
-
-!may use for debug
-!    dKdS_wat(:,:,:)=0d0
-!    dQdS_wat(:,:)  =0d0
-!    Keq_wat(:,:)   =0d0
-!     dKdr_wat(:,:,:,:,:)=0d0
+       !correction of Q0 and dQ/dr = dQdS * dS/dr
+       do ia_wX=1,4   !X1,X2,H1,H2
+          dQ_wat(ia_wX,imol) = sum(dQdS_wat(ia_wX,:)*S123(:))
+          do ia=1,3   !O,H1,H2
+          do ixyz=1,3 !x,y,z
+             dQdr_wat(ixyz,ia_wX,ia,imol) = sum( dQdS_wat(ia_wX,:)*dSdr(ixyz,:,ia) )
+          enddo
+          enddo
+       enddo
+       Q0ai(:,imol) = Qeq_withX_wat(:) + dQ_wat(:,imol)
+    enddo
 
   end subroutine
   
@@ -1931,10 +1790,10 @@ contains
 
 
   subroutine init_ewald_CRK
-    use salmon_global, only: aEwald, nEwald
+    use salmon_global, only: aEwald
     use inputoutput, only: au_length_aa
     implicit none
-    integer :: ihx,ihy,ihz, iG
+    integer :: ihx,ihy,ihz, iG, nhx,nhy,nhz
     real(8) :: Gcoef(3), G2_tmp
 
    !a_ewald = sqrt(aEwald)  !aEwald from input means (alpha)**2
@@ -1943,15 +1802,38 @@ contains
     write(*,*) "alpha of ewald =", a_ewald/au_length_aa, "  [1/A]"
     L3 = aL(1)*aL(2)*aL(3)
     coef_derfc = 2d0*a_ewald/sqrt(pi)
-
     Gcoef(:) = 2d0*pi/aL(:)
-    G_cutoff = maxval(abs(Gcoef(:)*nEwald))
-    if (comm_is_root(nproc_id_global)) write(*,*) "G-cutoff radius =",G_cutoff/au_length_aa," [1/A]"
+
+    ihx=0
+    do
+       ihx=ihx+1
+       if(abs(Gcoef(1)*ihx).gt.G_cutoff)then
+          nhx=ihx
+          exit
+       endif
+    enddo
+    ihy=0
+    do
+       ihy=ihy+1
+       if(abs(Gcoef(2)*ihy).gt.G_cutoff)then
+          nhy=ihy
+          exit
+       endif
+    enddo
+    ihz=0
+    do
+       ihz=ihz+1
+       if(abs(Gcoef(3)*ihz).gt.G_cutoff)then
+          nhz=ihz
+          exit
+       endif
+    enddo
+    if (comm_is_root(nproc_id_global)) write(*,*) "nhx,nhy,nhz=",nhx,nhy,nhz
 
     nG_cmd=0
-    do ihx= -nEwald, nEwald
-    do ihy= -nEwald, nEwald
-    do ihz= -nEwald, nEwald
+    do ihx= -nhx, nhx
+    do ihy= -nhy, nhy
+    do ihz= -nhz, nhz
        if(ihx*ihx+ihy*ihy+ihz*ihz==0) cycle  !exclude G=0
        G2_tmp = (Gcoef(1)*ihx)**2 + (Gcoef(2)*ihy)**2 + (Gcoef(3)*ihz)**2
        if(G2_tmp .gt. G_cutoff**2) cycle
@@ -1963,9 +1845,9 @@ contains
     allocate( Gvec(3,nG_cmd),G2(nG_cmd) )
 
     iG=0
-    do ihx= -nEwald, nEwald
-    do ihy= -nEwald, nEwald
-    do ihz= -nEwald, nEwald
+    do ihx= -nhx, nhx
+    do ihy= -nhy, nhy
+    do ihz= -nhz, nhz
        if(ihx*ihx+ihy*ihy+ihz*ihz==0) cycle  !exclude G=0
        G2_tmp = (Gcoef(1)*ihx)**2 + (Gcoef(2)*ihy)**2 + (Gcoef(3)*ihz)**2
        if(G2_tmp .gt. G_cutoff**2) cycle
@@ -1989,6 +1871,9 @@ contains
 
     sumQicosGri(:) = 0d0
     sumQisinGri(:) = 0d0
+!$omp parallel do collapse(2) &
+!$omp    private(iG,imol,ia_wX,GR) &
+!$omp    reduction(+:sumQicosGri,sumQisinGri)
     do iG=1,nG_cmd
     do imol=1,nmol
     do ia_wX=1,natom_wX_mol(imol)
@@ -1998,6 +1883,7 @@ contains
     enddo
     enddo
     enddo
+!$omp end parallel do
 
   end subroutine
 
@@ -2017,5 +1903,30 @@ contains
     enddo
 
   end subroutine
+
+!!OpenMP manual reduction routine
+!!(this is from the file, ion_force.f90)
+!  subroutine mreduce_omp(vout,vtmp,vsize,tid)
+!    use opt_variables, only: NUMBER_THREADS_POW2
+!    implicit none
+!    integer,intent(in)  :: vsize,tid
+!    real(8),intent(out) :: vout(vsize)
+!    real(8)             :: vtmp(vsize,0:NUMBER_THREADS_POW2-1)
+!
+!    integer :: i
+!
+!    i = NUMBER_THREADS_POW2/2
+!    do while(i > 0)
+!      if(tid < i) then
+!        vtmp(:,tid) = vtmp(:,tid) + vtmp(:,tid + i)
+!      end if
+!      i = i/2
+!!$omp barrier
+!    end do
+!
+!    if (tid == 0) then
+!      vout(:) = vtmp(:,0)
+!    end if
+!  end subroutine
   
 end module

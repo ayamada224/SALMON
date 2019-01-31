@@ -20,10 +20,6 @@
 ! Optimization in the ground state by conjugate gradient method
 !-----------------------------------------------------------------
 module optimization
-  implicit none
-contains
-
-subroutine calc_opt_ground_state
   use Global_Variables
   use timer
   use opt_variables
@@ -35,6 +31,10 @@ subroutine calc_opt_ground_state
   use ground_state
   use io_gs_wfn_k
   use md_ground_state, only: write_xyz
+  implicit none
+contains
+
+  subroutine calc_opt_ground_state
   implicit none
   integer :: ia, nfree
 
@@ -58,15 +58,15 @@ subroutine calc_opt_ground_state
   endif
   return
 
-contains
+  end subroutine
 
 !----------------------------------------------
-subroutine calc_opt_ground_state_useF
+  subroutine calc_opt_ground_state_useF
 
   implicit none
-  integer :: i,j,k,iter_perp,iter_line, Nopt_perp,Nopt_line,ia
+  integer :: i,iter_perp,iter_line, Nopt_perp,Nopt_line,ia
   real(8) :: gm, tmp1,tmp2,tmp3, Rion_save(3,NI),dRion_rmsd
-  real(8) :: StepLen_line0, StepLen_line(2), StepLen_line_small
+  real(8) :: StepLen_line(2), StepLen_line_small  !StepLen_line0
   real(8) :: StepLen_line_new, StepLen_line_zero, sl_zero
   real(8) :: StepLen_line_Up, StepLen_line_Dw
   real(8) :: SearchDirection(3,NI),SearchDirection_1d(3*NI)
@@ -391,10 +391,10 @@ subroutine calc_opt_ground_state_useF
     &      "    Force(average)=",e18.10," [a.u.]",/ &
     &      "    Total Energy  =",e18.10," [a.u.]" )
 
-end subroutine calc_opt_ground_state_useF
+  end subroutine calc_opt_ground_state_useF
 
 !----------------------------------------------
-subroutine calc_opt_ground_state_useE
+  subroutine calc_opt_ground_state_useE
 
   implicit none
   integer :: i,j,k,iter_perp,iter_line,iter_line2, Nopt_perp,Nopt_line
@@ -408,8 +408,8 @@ subroutine calc_opt_ground_state_useE
   real(8) :: force_prev(3,NI), force_1d(3*NI), force_prev_1d(3*NI)
   integer :: nsave
   real(8) :: alpha_save(9999), ene_save(9999)
-  logical :: flag_min_found
   character(100) :: comment_line
+  !logical :: flag_min_found
 
   position_option='rewind'
 
@@ -686,7 +686,7 @@ subroutine calc_opt_ground_state_useE
 130 format(" step-perp=",i4,"  step-line=",i4,"  E=",e16.8,"  dE-line=",e16.8)
 135 format(" step-perp=",i4,"  step-line=",i4,"  E=",e16.8,"  dE-perp=",e16.8)
 
-end subroutine calc_opt_ground_state_useE
+  end subroutine calc_opt_ground_state_useE
     
   subroutine manipulate_wfn_data(action)
     implicit none
@@ -698,9 +698,6 @@ end subroutine calc_opt_ground_state_useE
     integer,parameter :: nfile_occ      =  42
     integer,parameter :: nfile_occ_save = 142
     integer :: ik
-    integer :: nproc_group_kpoint_ms
-    integer :: nproc_id_kpoint_ms
-    integer :: nproc_size_kpoint_ms
 
     write (gs_wfn_directory,'(A,A)') trim(directory),'/gs_wfn_k/'
 
@@ -760,7 +757,7 @@ end subroutine calc_opt_ground_state_useE
 
   subroutine get_predicted_zero(sl,fl,sl_zero)
     implicit none
-    real(8) :: sl(2),fl(2),sl_zero,dsl,dfldsl,b
+    real(8) :: sl(2),fl(2),sl_zero,dfldsl,b
 
     dfldsl  = ( fl(2) - fl(1) ) / ( sl(2) - sl(1) )
     b       = dfldsl * sl(1) - fl(1)
@@ -899,8 +896,8 @@ end subroutine calc_opt_ground_state_useE
     return
   end subroutine
 
-subroutine add_alpha_save(nsave,alpha_save,ene_save,alpha,ene)
-! save alpha and it's Eall for line search
+  subroutine add_alpha_save(nsave,alpha_save,ene_save,alpha,ene)
+  ! save alpha and it's Eall for line search
   integer :: i,nsave,n
   real(8) :: alpha_save(9999),ene_save(9999),alpha,ene
   real(8) :: alpha_bk(nsave),ene_bk(nsave)
@@ -941,10 +938,10 @@ subroutine add_alpha_save(nsave,alpha_save,ene_save,alpha,ene)
      endif
   enddo
 
-end subroutine
+  end subroutine
 
-subroutine find_min_from_save(nsave,alpha_save,ene_save,alpha3p,ene3p,flag_min_found)
-! save alpha and it's Eall for line search
+  subroutine find_min_from_save(nsave,alpha_save,ene_save,alpha3p,ene3p,flag_min_found)
+  ! save alpha and it's Eall for line search
   integer    i,nsave,i_min
   real(8) :: alpha_save(9999),ene_save(9999),alpha3p(3),ene3p(3)
   real(8) :: e_min,a_min
@@ -970,9 +967,7 @@ subroutine find_min_from_save(nsave,alpha_save,ene_save,alpha3p,ene3p,flag_min_f
      flag_min_found=.true.
   endif
 
-end subroutine
-
-end subroutine calc_opt_ground_state
+  end subroutine
 
   subroutine cal_mean_max_forces(NI,f,fave,fmax)
     use Global_Variables, only: flag_geo_opt_atom
