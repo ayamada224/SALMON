@@ -30,13 +30,15 @@ contains
   use salmon_file
   use misc_routines
   use timer
-  use force_field_CRK, only: allocate_ff_CRK,load_force_field_CRK,prepare_force_field_CRK
-!  use inputoutput, only: au_length_aa
+  use force_field_CRK, only: allocate_ff_CRK,load_force_field_CRK,prepare_force_field_CRK,&
+                              iter_max, dQave_thresh, a_ewald, r_cutoff, G_cutoff
+  use inputoutput, only: au_length_aa
   implicit none
+ !logical :: flag_advanced
   integer :: is,ispecies, imol,num_mol
   integer :: tmp_natom, tmp_mol2species(NI), tmp_mol2atom_top(NI+1)
   character(1024) :: ifile_cmd_sc
-  character(100)  :: ctmp1
+  character(100)  :: ctmp1 !keywd
 
   !(read input no.1)
   if (comm_is_root(nproc_id_global)) then
@@ -78,7 +80,7 @@ contains
      enddo
   endif
 
-  !(read input no.3 & close the file)
+  !(read input no.3)
   if (comm_is_root(nproc_id_global)) then
      read(800,*) !comment line
      tmp_natom = 0
@@ -99,7 +101,7 @@ contains
            stop
         endif
      enddo
-100  close(800)
+100  continue
   endif
 
   call comm_bcast(nmol, nproc_group_global)
@@ -115,6 +117,33 @@ contains
   do imol=1,nmol
      natom_mol(imol) = natom_mol_s(mol2species(imol))
   enddo
+
+  !(read input no.4)
+  if (comm_is_root(nproc_id_global)) then
+     read(800,*) iter_max       !=50 is enough
+     read(800,*) dQave_thresh   !=1d-7 [au]  (from paper)
+     read(800,*) a_ewald        != [1/A]
+     read(800,*) r_cutoff       !=13.0 [A]   (from paper)
+     read(800,*) G_cutoff       !=1.47 [1/A] (from paper)
+     a_ewald  = a_ewald *au_length_aa !to [1/Bohr]
+     r_cutoff = r_cutoff/au_length_aa !to [Bohr]
+     G_cutoff = G_cutoff*au_length_aa !to [1/Bohr]
+  endif
+
+  call comm_bcast(iter_max,     nproc_group_global)
+  call comm_bcast(dQave_thresh, nproc_group_global)
+  call comm_bcast(a_ewald,      nproc_group_global)
+  call comm_bcast(r_cutoff,     nproc_group_global)
+  call comm_bcast(G_cutoff,     nproc_group_global)
+
+  !(read input no.5 & close the file)
+  if (comm_is_root(nproc_id_global)) then
+!     read(800,*) flag_advanced  !=.false.
+!     if(flag_advanced)then
+!        read(800,*) keywd
+!     endif
+     close(800)
+  endif
 
   !(log)
   if (comm_is_root(nproc_id_global)) then
@@ -136,7 +165,15 @@ contains
   end subroutine
 
 !------------------------------------------------------------------------
-  subroutine opt_cmd   !conjugated method
+  subroutine opt_cmd
+    implicit none
+
+    call  opt_cmd_conjugate
+!    call  opt_cmd_steepest
+
+  end subroutine
+!------------------------------------------------------------------------
+  subroutine opt_cmd_conjugate   !conjugated method
     use md_ground_state
     use optimization, only: variable_3xNto3N,cal_inner_product, &
                       get_predicted_zero,update_2pt_line_search,cal_mean_max_forces
@@ -265,7 +302,6 @@ contains
        !(adjust initial step length)
 10     continue
        i= 2
-       !call manipulate_wfn_data('load')
        Rion(:,:)   = Rion_save(:,:) + StepLen_line(i)* SearchDirection(:,:)
        Rion_eq(:,:)= Rion(:,:)
        dRion_rmsd  = StepLen_line(i)*sqrt(sum(SearchDirection_1d(:)**2)/NI)
@@ -420,7 +456,7 @@ contains
 
        !---Write section---
        ! Export to file_rt_data
-       call write_cmd_data(iter,Uene,fmax,fave,zero,zero,zero,zero3,"opt")
+       call write_cmd_data(iter,Uene,fmax,fave,zero,zero,zero,zero,zero3,zero3,zero3,"opt")
 
 
     enddo !end of opt iteraction========================
@@ -502,7 +538,7 @@ contains
 
        !---Write section---
        ! Export to file_rt_data
-       call write_cmd_data(iter,Uene,fmax,fave,zero,zero,zero,zero3,"opt")
+       call write_cmd_data(iter,Uene,fmax,fave,zero,zero,zero,zero,zero3,zero3,zero3,"opt")
 
        ! Export to standard log file
        if(comm_is_root(nproc_id_global)) then
@@ -533,16 +569,19 @@ contains
 !------------------------------------------------------------------------
   subroutine cmd_sc
     use md_ground_state
-    use force_field_CRK, only: cal_force_energy_CRK
+    use force_field_CRK, only: cal_force_energy_CRK, Vuc
     implicit none
     integer :: it,ia
     real(8) :: dt_h, aforce(3,NI)
     real(8) :: Temp_sys, mass_au
-    real(8) :: Htot, Enh, Enh_gkTlns, gkT, Qnh
-    real(8) :: Mt(3)
+    real(8) :: Htot, Enh, Enh_gkTlns, gkT, Qnh, Eem
+    real(8) :: Mt(3),Jmt(3)
     character(100) :: comment_line
 
     call take_back_mol_into_ucell
+    call init_Ac
+    it = 0
+    Et(:) = -( Ac_ext(it+1,:) - Ac_ext(it-1,:) ) / (2*dt)
 
     ! Export to file_trj (initial step)
     if (out_rvf_rt=='y')then
@@ -553,6 +592,10 @@ contains
        call write_xyz(comment_line,"new","rvf")
        call write_xyz(comment_line,"add","rvf")
     endif
+
+    Mt(:)=0d0
+    call cal_dipole_moment_current(Mt,Jmt,dt)
+    Jmt(:)=0d0
 
     it         = 0
     dt_h       = dt*0.5d0
@@ -573,6 +616,10 @@ contains
 
     ! === Main loop of time step ===
     do it = 0, Nt
+
+       !Electric field
+       Et(:) = -( Ac_ext(it+1,:) - Ac_ext(it-1,:) ) / (2*dt)
+       Eem   = Vuc * sum(Et(:)**2)/(8d0*pi)
 
        ! Velocity Verlet integrator
 
@@ -610,7 +657,6 @@ contains
        !update force (electric state) with updated coordinate
        aforce(:,:) = force(:,:)
        call cal_force_energy_CRK
-
        aforce(:,:) = 0.5d0*( aforce(:,:) + force(:,:) )
 
        do ia=1,NI
@@ -628,16 +674,16 @@ contains
 
 
        call cal_Tion_Temperature_ion(Tene,Temp_sys,velocity)
-       Eall     = Uene + Tene
+       Eall     = Uene + Tene + Eem
        Htot     = Eall + Enh
 
 
        !---Analyses section---
-       call cal_dipole_moment(Mt)
+       call cal_dipole_moment_current(Mt,Jmt,dt)
 
        !---Write section---
        ! Export to file_rt_data
-       call write_cmd_data(it,Tene,Uene,Eall,Temp_sys,Enh,Htot,Mt,"rt")
+       call write_cmd_data(it,Tene,Uene,Eem,Eall,Temp_sys,Enh,Htot,Et,Mt,Jmt,"rt")
 
        ! Export to standard log file
        if(comm_is_root(nproc_id_global)) then
@@ -688,13 +734,13 @@ contains
 
   end subroutine
 
-  subroutine write_cmd_data(it,dat1,dat2,dat3,dat4,dat5,dat6,dat7,mode)
-    use inputoutput, only: t_unit_time,t_unit_energy
+  subroutine write_cmd_data(it,dat1,dat2,dat3,dat4,dat5,dat6,dat7,dat8,dat9,dat10,mode)
+    use inputoutput, only: t_unit_time,t_unit_energy,t_unit_elec,t_unit_current
     implicit none
     integer :: fh_rt=202, it
-    real(8) :: dat1,dat2,dat3,dat4,dat5,dat6,dat7(3)
-    real(8) :: Tene_t,Uene_t,Eall_t,Temp_sys_t,Enh_t,Htot_t, Fmax_t,Fave_t
-    real(8) :: M_t(3)
+    real(8) :: dat1,dat2,dat3,dat4,dat5,dat6,dat7,dat8(3),dat9(3),dat10(3)
+    real(8) :: Tene_t,Uene_t,Eem_t,Eall_t,Temp_sys_t,Enh_t,Htot_t, Fmax_t,Fave_t
+    real(8) :: E_t(3), M_t(3), Jm_t(3)
     character(*) :: mode
 
     if(comm_is_root(nproc_id_global)) then
@@ -702,11 +748,14 @@ contains
        if(mode=="rt")then         
           Tene_t     = dat1
           Uene_t     = dat2
-          Eall_t     = dat3
-          Temp_sys_t = dat4
-          Enh_t      = dat5
-          Htot_t     = dat6
-          M_t(:)     = dat7(:)
+          Eem_t      = dat3
+          Eall_t     = dat4
+          Temp_sys_t = dat5
+          Enh_t      = dat6
+          Htot_t     = dat7
+          E_t(:)     = dat8(:)
+          M_t(:)     = dat9(:)
+          Jm_t(:)    = dat10(:)
        else if(mode=="opt")then
           Uene_t = dat1
           Fmax_t = dat2
@@ -720,23 +769,33 @@ contains
             write(fh_rt, '("#",1X,A)') "time (Classical MD)"
             write(fh_rt, '("#",1X,A,":",1X,A)') "Tene", "Kinetic energy"
             write(fh_rt, '("#",1X,A,":",1X,A)') "Uene", "Potential energy"
+            write(fh_rt, '("#",1X,A,":",1X,A)') "Eem",  "Energy of electric field"
             write(fh_rt, '("#",1X,A,":",1X,A)') "Eall", "Total energy"
-            write(fh_rt, '("#",1X,A,":",1X,A)') "Temp_sys", "Temperature of system"
-            write(fh_rt, '("#",1X,A,":",1X,A)') "Enh", "Energy of NH thermostat"
+            write(fh_rt, '("#",1X,A,":",1X,A)') "Temp", "Temperature"
+            write(fh_rt, '("#",1X,A,":",1X,A)') "Enh",  "Energy of NH thermostat"
             write(fh_rt, '("#",1X,A,":",1X,A)') "Hnvt", "Hamiltonian with NH thermostat"
+            write(fh_rt, '("#",1X,A,":",1X,A)') "Et", "Electric field"
             write(fh_rt, '("#",1X,A,":",1X,A)') "Mt", "Dipole Moment of the system"
+            write(fh_rt, '("#",1X,A,":",1X,A)') "Jmt","Matter current density"
          
             write(fh_rt, '("#",99(1X,I0,":",A,"[",A,"]"))')&
                  &  1, "Time",   trim(t_unit_time%name),   &
                  &  2, "Tene",   trim(t_unit_energy%name), &
                  &  3, "Uene",   trim(t_unit_energy%name), &
-                 &  4, "Eall",   trim(t_unit_energy%name), &
-                 &  5, "Temp_sys", "K",                    &
-                 &  6, "Enh",    trim(t_unit_energy%name), &
-                 &  7, "Hnvt",   trim(t_unit_energy%name), &
-                 &  8, "Mt_x",   "a.u.", &
-                 &  9, "Mt_y",   "a.u.", &
-                 & 10, "Mt_z",   "a.u."
+                 &  4, "Eem",    trim(t_unit_energy%name), &
+                 &  5, "Eall",   trim(t_unit_energy%name), &
+                 &  6, "Temp",   "K",                      &
+                 &  7, "Enh",    trim(t_unit_energy%name), &
+                 &  8, "Hnvt",   trim(t_unit_energy%name), &
+                 &  9, "Et_x",   trim(t_unit_elec%name),   &
+                 & 10, "Et_y",   trim(t_unit_elec%name),   &
+                 & 11, "Et_z",   trim(t_unit_elec%name),   &
+                 & 12, "Mt_x",   "a.u.",  &
+                 & 13, "Mt_y",   "a.u.",  &
+                 & 14, "Mt_z",   "a.u.",  &
+                 & 15, "Jmt_x", trim(t_unit_current%name), &
+                 & 16, "Jmt_y", trim(t_unit_current%name), &
+                 & 17, "Jmt_z", trim(t_unit_current%name)
 
          else if(mode=="opt")then
             write(fh_rt, '("#",1X,A)') "step (Optimization)"
@@ -758,13 +817,14 @@ contains
               & it * dt   * t_unit_time%conv,   &
               & Tene_t    * t_unit_energy%conv, &
               & Uene_t    * t_unit_energy%conv, &
+              & Eem_t     * t_unit_energy%conv, &
               & Eall_t    * t_unit_energy%conv, &
               & Temp_sys_t,                     &
               & Enh_t     * t_unit_energy%conv, &
               & Htot_t    * t_unit_energy%conv, &
-              & M_t(1),                         &
-              & M_t(2),                         &
-              & M_t(3)
+              & E_t(1:3)  * t_unit_elec%conv,   &
+              & M_t(1:3),                       &
+              & Jm_t(1:3) * t_unit_current%conv
       else if(mode=="opt")then
          write(fh_rt, "(I8,99(1X,E23.15E3))")   &
               & it,                             &
@@ -782,12 +842,16 @@ contains
     return
   end subroutine write_cmd_data
 
-  subroutine cal_dipole_moment(dipole_mom)
-    use force_field_CRK, only: Qai,Rxyz_wX,natom_wX_mol
+  subroutine cal_dipole_moment_current(dipole_mom,current_matter,dt)
+    ! dipole_mom : (in & out)
+    use force_field_CRK, only: Qai,Rxyz_wX,natom_wX_mol,Vuc
     implicit none
     integer :: imol,ia_wX
-    real(8) :: dipole_mom(3)
+    real(8) :: dipole_mom(3), dipole_mom_last(3), current_matter(3), dt
 
+    dipole_mom_last(:) = dipole_mom(:)
+
+    !dipole moment in unit cell
     dipole_mom(:) = 0d0
     do imol=1,nmol
     do ia_wX=1,natom_wX_mol(imol)
@@ -795,6 +859,10 @@ contains
     enddo
     enddo
 
-  end subroutine cal_dipole_moment
+    !matter current defined by positive charge-->minus sign
+    current_matter(:) = -(dipole_mom(:) - dipole_mom_last(:))/dt/Vuc
+
+
+  end subroutine cal_dipole_moment_current
 
 end module

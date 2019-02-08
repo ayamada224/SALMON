@@ -329,7 +329,7 @@ Module Global_Variables
   integer :: nmol_s, nmol
   integer,allocatable :: natom_mol_s(:), natom_mol(:)
   integer,allocatable :: mol2species(:), mol2atom_top(:), mol2atom_cnt(:)
-  real(8) :: Uene,Tene
+  real(8) :: Uene,Tene, Et(3)
   character(20),allocatable :: name_mol_s(:)
   character(20) :: force_field_system
 
