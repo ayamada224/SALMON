@@ -22,6 +22,8 @@ module control_sc_cmd
   use salmon_communication, only: comm_bcast, comm_sync_all, comm_is_root
   use salmon_parallel, only: nproc_id_global
   implicit none
+  logical :: flag_fix_atoms_md
+
 contains
 
   subroutine init_cmd_sc
@@ -578,6 +580,9 @@ contains
     real(8) :: Mt(3),Jmt(3)
     character(100) :: comment_line
 
+    flag_fix_atoms_md=.false.
+    if(flag_fix_atoms_md .and. comm_is_root(nproc_id_global)) write(*,*)"Atom is fixed"
+
     call take_back_mol_into_ucell
     call init_Ac
     it = 0
@@ -620,6 +625,12 @@ contains
        !Electric field
        Et(:) = -( Ac_ext(it+1,:) - Ac_ext(it-1,:) ) / (2*dt)
        Eem   = Vuc * sum(Et(:)**2)/(8d0*pi)
+
+       if(flag_fix_atoms_md) then
+          call cal_force_energy_CRK
+          Tene=0d0
+          goto 100
+       endif
 
        ! Velocity Verlet integrator
 
@@ -674,9 +685,11 @@ contains
 
 
        call cal_Tion_Temperature_ion(Tene,Temp_sys,velocity)
+
+100    continue
+
        Eall     = Uene + Tene + Eem
        Htot     = Eall + Enh
-
 
        !---Analyses section---
        call cal_dipole_moment_current(Mt,Jmt,dt)
@@ -858,9 +871,10 @@ contains
        dipole_mom(:) = dipole_mom(:) + Qai(ia_wX,imol)*Rxyz_wX(:,ia_wX,imol)
     enddo
     enddo
+    dipole_mom(:) = dipole_mom(:)/Vuc
 
     !matter current defined by positive charge-->minus sign
-    current_matter(:) = -(dipole_mom(:) - dipole_mom_last(:))/dt/Vuc
+    current_matter(:) = -(dipole_mom(:) - dipole_mom_last(:))/dt
 
 
   end subroutine cal_dipole_moment_current

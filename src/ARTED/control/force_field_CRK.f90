@@ -347,6 +347,7 @@ contains
     else
        nc_max = 1
     endif
+    if(comm_is_root(nproc_id_global)) write(*,*) "flag_use_over_cell=",flag_use_over_cell
     if(comm_is_root(nproc_id_global)) write(*,*) "R-cutoff radius =",r_cutoff*au_length_aa," [A]"
     if(comm_is_root(nproc_id_global)) write(*,*) "G-cutoff radius =",G_cutoff/au_length_aa," [1/A]"
     if(comm_is_root(nproc_id_global)) write(*,*) "# of cells used in R-cutoff=",ncell_max(:)
@@ -379,8 +380,8 @@ contains
     force(:,:) = 0d0
 
     call force_energy_intramolecular_CRK
-   !call force_energy_intermolecular_CRK
-    call force_energy_intermolecular_CRK_cluster
+    call force_energy_intermolecular_CRK
+   !call force_energy_intermolecular_CRK_cluster
 
   end subroutine
 
