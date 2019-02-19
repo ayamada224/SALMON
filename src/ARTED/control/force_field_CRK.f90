@@ -542,7 +542,6 @@ contains
     real(8) :: erf_rij,exp_rij, a_ewald_rij
     real(8) :: tmp_s,tmp_c,tmp_coef,tmp1,tmp2,tmp3
 
-
     if(nmol_s.ge.2) then
        call Err_finalize("Now combination rule of vdw is not supported except for water")
        stop
