@@ -22,11 +22,20 @@ module control_ms_cmd
   use salmon_communication, only: comm_bcast, comm_sync_all, comm_is_root
   use salmon_parallel, only: nproc_id_global
   implicit none
-  logical :: flag_ms_ff_LessPrint, flag_fix_atoms_md, flag_use_absorb_bound
-  integer :: iter_save
+  logical :: flag_ms_ff_LessPrint,  flag_fix_atoms_md 
+  logical :: flag_use_absorb_bound, flag_use_light_source
+  logical :: flag_use_E_B
+  integer :: iter_save, ix_light_source
+  integer :: M_pml,nx_pml, nx1_pml,nx2_pml
   real(8),allocatable :: Rion_eq0(:,:) 
   real(8),allocatable :: Qai_ms(:,:,:), Rxyz_wX_ms(:,:,:,:)
   real(8),allocatable :: Uene_ms(:), Tene_ms(:), Eall_ms(:)
+  real(8),allocatable :: E_ms(:,:,:,:), B_ms(:,:,:,:)
+  real(8),allocatable :: E_m(:,:), B_m(:,:)
+  real(8),allocatable :: E_last(:,:,:,:), B_last(:,:,:,:)
+  real(8) :: R_pml, sgm_max_E_pml, sgm_max_B_pml
+  character(3) :: ABC_method
+
 contains
 
 subroutine init_cmd_maxwell_ms
@@ -55,6 +64,17 @@ subroutine init_cmd_maxwell_ms
      stop
   endif
 
+  flag_use_E_B = .true.  !test hoge
+  if(flag_use_E_B) then
+     if(comm_is_root(nproc_id_global)) write(*,*) "flag_use_E_B= ", flag_use_E_B
+     allocate( E_ms(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+     allocate( B_ms(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+     allocate( E_m(1:3,1:nmacro) )
+     allocate( B_m(1:3,1:nmacro) )
+     allocate( E_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+     allocate( B_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+  endif
+
   !(read input no.1)
   if (comm_is_root(nproc_id_global)) then
      write(*,*) "--- Read cmd_ms.inp.inp file for classical MD multiscale calculation"
@@ -63,6 +83,20 @@ subroutine init_cmd_maxwell_ms
      read(800,*) flag_ms_ff_LessPrint
      read(800,*) flag_fix_atoms_md
      read(800,*) flag_use_absorb_bound
+     if(flag_use_absorb_bound) then
+        backspace 800
+        read(800,*) flag_use_absorb_bound,ABC_method !ABC_method="PML" or "Mur"
+        if(ABC_method=="PML") then
+           backspace 800
+           read(800,*) flag_use_absorb_bound,ABC_method,R_pml,M_pml,nx_pml
+           !usually, M_pml=2-4, R_pml=1d-4-1d-8, nx_pml=10-50
+        endif
+     endif
+     read(800,*) flag_use_light_source
+     if(flag_use_light_source) then
+        backspace 800
+        read(800,*) flag_use_light_source, ix_light_source
+     endif
 
      read(800,*) !comment line
      read(800,*) force_field_system  ! force field of whole system
@@ -81,8 +115,13 @@ subroutine init_cmd_maxwell_ms
   call comm_bcast(flag_ms_ff_LessPrint, nproc_group_global)
   call comm_bcast(flag_fix_atoms_md,    nproc_group_global)
   call comm_bcast(flag_use_absorb_bound,nproc_group_global)
-  call comm_bcast(force_field_system, nproc_group_global)
-  call comm_bcast(nmol_s,             nproc_group_global)
+  call comm_bcast(flag_use_light_source,nproc_group_global)
+  call comm_bcast(ABC_method,           nproc_group_global)
+  call comm_bcast(R_pml,                nproc_group_global)
+  call comm_bcast(M_pml,                nproc_group_global)
+  call comm_bcast(nx_pml,               nproc_group_global)
+  call comm_bcast(force_field_system,   nproc_group_global)
+  call comm_bcast(nmol_s,               nproc_group_global)
 
   allocate( name_mol_s(nmol_s) ) ! molecular species name
 
@@ -170,6 +209,13 @@ subroutine init_cmd_maxwell_ms
 
   !(log)
   if (comm_is_root(nproc_id_global)) then
+     if(flag_use_absorb_bound) then
+        write(*,*) "flag_use_absorb_bound= ", flag_use_absorb_bound
+        write(*,*) "ABC_method= ", trim(ABC_method)
+        if(ABC_method=="PML") then
+           write(*,*) "R, M, nx=", real(R_pml), M_pml, nx_pml
+        endif
+     endif
      if(flag_fix_atoms_md) write(*,*) "Atom is fixed"
      write(*,*) "   total number of molecules =", nmol
      write(*,*) "   total number of molecular species =", nmol_s
@@ -238,7 +284,7 @@ subroutine cmd_maxwell_ms
   use salmon_communication
   use salmon_file
   use misc_routines
-  use inputoutput, only: t_unit_time, t_unit_current, t_unit_ac
+  use inputoutput, only: t_unit_time, t_unit_current, t_unit_ac, t_unit_elec
   use restart, only: prep_restart_write
 
   implicit none
@@ -271,12 +317,15 @@ subroutine cmd_maxwell_ms
     end if
 
 !====RT calculation============================
-    if (trim(FDTDdim) == '2DC') then
-      ! TODO: FIx the initialization routine
-      call init_Ac_ms_2dc()
+
+    if(flag_use_light_source) then
+       if(comm_is_root(nproc_id_global)) write(*,*) "use light source"
     else
       call init_Ac_ms
     endif
+
+    if(flag_use_absorb_bound .and. ABC_method=="PML") &
+    call init_absorb_bound_1d_PML_EB
     
     deallocate(zu_t)
 
@@ -350,26 +399,23 @@ subroutine cmd_maxwell_ms
 
     !! Update of the Macroscopic System
     
-    !===========================================================================
-    call timer_begin(LOG_OTHER)
     !! NOTE: Update the macroscopic variables:
     !!       Ac_old_ms = Ac_ms; Ac_ms = Ac_new_ms; Ac_new_ms = 0
     !!       Jm_old_ms = Jm_ms; Jm_ms = Jm_new_ms; Jm_new_ms = 0
     !!       Energy_Elec_ms = map(Energy_Elec_Matter_new_m); Jm_m = Jm_new_m;
     call proceed_ms_variables_omp()
-    call timer_end(LOG_OTHER)
-    !===========================================================================
 
-    !===========================================================================
+
     !! Calculate "iter+1" macroscopic field (Ac_new_ms, Jm_new_ms)
-    call timer_begin(LOG_DT_EVOLVE_AC)
     iter_save=iter
-    call dt_evolve_Ac_1d_cmd() ! Timer: LOG_DT_EVOLVE_AC
-    call timer_end(LOG_DT_EVOLVE_AC)
-    !===========================================================================
-    !===========================================================================    
+    if(flag_use_E_B) then
+       call dt_evolve_EB_1d_cmd() ! Timer: LOG_DT_EVOLVE_AC
+    else
+       call dt_evolve_Ac_1d_cmd() ! Timer: LOG_DT_EVOLVE_AC
+    endif
+
+
     !! Compute EM field, energy and other important quantities...
-    call timer_begin(LOG_OTHER) ! TODO: Create new timer "LOG_EMFIELD" later
     call calc_energy_joule()
     if (flg_out_ms_step) then !! mod(iter, out_ms_step) == 0
       call calc_elec_field()
@@ -377,12 +423,8 @@ subroutine cmd_maxwell_ms
       call calc_energy_elemag()
       call calc_total_energy
     end if
-    call timer_end(LOG_OTHER)
-    !===========================================================================    
 
 
-    !=========================================================================== 
-    call timer_begin(LOG_OTHER)
     !! NOTE: Mapping between the macropoint and the gridsystem
     !!       Ac_m <- Ac_ms; Ac_new_m <- Ac_new_ms
     !!       data_local_Ac_m = Ac_m; data_local_Jm_m = Jm_m
@@ -395,29 +437,15 @@ subroutine cmd_maxwell_ms
       index = iter / out_ms_step
       call store_data_out_omp(index)
     end if
-    call timer_end(LOG_OTHER)
-    !===========================================================================
 
-    !===========================================================================
-    call timer_begin(LOG_OTHER)
+
     if (flg_out_ms_step .and. comm_is_root(nproc_id_global)) then
-      call trace_ms_calculation()
+      !call trace_ms_calculation()
+      write(*,'(1X,A,I6,A,I6)') 'Multiscale iter =', iter, '/', Nt
     end if
-    call timer_end(LOG_OTHER)
-    !===========================================================================
+
 
     !! Update of the Microscopic System
-    
-    ! if (iter == Nt) break
-
-    !! NOTE: Since the microscopic calculation at final step doesn't written in
-    !!       any output file by the program. The calculation of the microscopic
-    !!       system at iter=Nt is seemingfly meaningless.
-    !!       However, in present implementation, the iter=Nt data is stored to 
-    !!       the BACKUP, this checkpoint helps to restart from Nt+1 step.
-    !!       If the backup is not required in the calculation, 
-    !!       the use of the above "break" is prefereble... 
-    !! TODO: Make it possible to export all data from 0 to Nt+1.
     
     !! NOTE: flg_out_ms_step (the macroscopic field will exported in next step)
     flg_out_ms_next_step = .false.
@@ -464,16 +492,13 @@ subroutine cmd_maxwell_ms
     end do Macro_loop !end of Macro_loop iteraction========================
 
     !===========================================================================
-    call timer_begin(LOG_ALLREDUCE)
+
     call comm_summation(jm_new_m_tmp, Jm_new_m, 3 * nmacro, nproc_group_global)
     if (flg_out_ms_next_step) then
       call comm_summation(energy_elec_Matter_new_m_tmp, energy_elec_Matter_new_m, nmacro, nproc_group_global)
     end if
-    call timer_end(LOG_ALLREDUCE)
-    !===========================================================================
 
     
-    !===========================================================================
 !$omp parallel do default(shared) private(imacro, ix_m, iy_m, iz_m)
     do imacro = 1, nmacro
       !! NOTE: If the array "macropoint" is appropriately setted,
@@ -488,8 +513,9 @@ subroutine cmd_maxwell_ms
       Jm_new_ms(1:3, ix_m, iy_m, iz_m) = matmul(trans_inv(1:3,1:3), Jm_new_m(1:3, imacro))
     end do
 !$omp end parallel do
-    !===========================================================================
 
+
+    !===========================================================================
     ! Export to file_trj
     if (out_rvf_rt=='y' .and. mod(iter,out_rvf_rt_step)==0)then
        write(comment_line,110) iter, iter*dt
@@ -515,45 +541,16 @@ subroutine cmd_maxwell_ms
     endif
     !===========================================================================
     
-    ! Timer for shutdown
-    if (mod(iter,10) == 0) then
-      Time_now=get_wtime()
-      if (comm_is_root(nproc_id_global) .and. iter/100*100 == iter) then
-        write(*,*) 'Total time =',(Time_now-Time_start)
-      end if
-    end if
-
-    
   enddo RTiteratopm !end of RT iteraction========================
 
 
-  call timer_end(LOG_DYNAMICS)
 
   if(comm_is_root(nproc_id_global)) then
     write(*,'(1X,A)') '-----------------------------------------------'
-
-    call timer_show_hour('dynamics time      :', LOG_DYNAMICS)
-    call timer_show_min ('dt_evolve_Ac time  :', LOG_DT_EVOLVE_AC)
-    call timer_show_min ('dt_evolve time     :', LOG_DT_EVOLVE)
-    call timer_show_min ('hpsi time          :', LOG_HPSI)
-    call timer_show_min (' - init time       :', LOG_HPSI_INIT)
-    call timer_show_min (' - stencil time    :', LOG_HPSI_STENCIL)
-    call timer_show_min (' - pseudo pt. time :', LOG_HPSI_PSEUDO)
-    call timer_show_min (' - update time     :', LOG_HPSI_UPDATE)
-    call timer_show_min ('psi_rho time       :', LOG_PSI_RHO)
-    call timer_show_min ('Hartree time       :', LOG_HARTREE)
-    call timer_show_min ('Exc_Cor time       :', LOG_EXC_COR)
-    call timer_show_min ('current time       :', LOG_CURRENT)
-    call timer_show_min ('Total_Energy time  :', LOG_TOTAL_ENERGY)
-    call timer_show_min ('Ion_Force time     :', LOG_ION_FORCE)
-    call timer_show_min ('ana_RT_useGS time  :', LOG_ANA_RT_USEGS)
-    call timer_show_min ('Other time         :', LOG_OTHER)
-    call timer_show_min ('Allreduce time     :', LOG_ALLREDUCE)
   end if
   call write_performance(trim(directory)//'ms_performance')
 
   if(comm_is_root(nproc_id_global)) write(*,*) 'This is the start of write section'
-  call timer_begin(LOG_IO)
 
   ! Write data out by using MPI
   if(.not. flag_ms_ff_LessPrint) then !AY
@@ -587,29 +584,21 @@ subroutine cmd_maxwell_ms
   endif
 
 
-  call timer_end(LOG_IO)
   if(comm_is_root(nproc_id_global)) then
     write(*,*) 'This is the end of write section'
-    call timer_show_min('write time =',LOG_IO)
   end if
 
   if(comm_is_root(nproc_id_global)) then
     write(*,*) 'This is the end of RT calculation'
-    call timer_show_current_hour('elapse time=',LOG_ALL)
     write(*,*) '-----------------------------------------------------------'
   end if
 
-!====RT calculation===========================
   call comm_sync_all
 
-  if (comm_is_root(nproc_id_global)) write(*,*) 'This is the end of all calculation'
-  Time_now=get_wtime()
-  call timer_end(LOG_ALL)
-  if (comm_is_root(nproc_id_global)) call timer_show_hour('Total time =',LOG_ALL)
+  if(comm_is_root(nproc_id_global)) write(*,*) 'This is the end of all calculation'
+1 if(comm_is_root(nproc_id_global)) write(*,*) 'This calculation is shutdown successfully!'
 
-1 if(comm_is_root(nproc_id_global)) write(*,*)  'This calculation is shutdown successfully!'
-
-
+!========================================================
 contains
 
   subroutine reset_rt_timer
@@ -624,28 +613,31 @@ contains
   subroutine proceed_ms_variables_omp()
     implicit none
     integer :: iimacro, iix_m, iiy_m, iiz_m
+
+    if(.not.flag_use_E_B) then
 !$omp parallel do collapse(3) default(shared) private(iix_m, iiy_m, iiz_m)
-    do iiz_m = mz1_m, mz2_m
-      do iiy_m = my1_m, my2_m
-        do iix_m = mx1_m, mx2_m
+       do iiz_m = mz1_m, mz2_m
+       do iiy_m = my1_m, my2_m
+       do iix_m = mx1_m, mx2_m
           Ac_old_ms(1:3, iix_m, iiy_m, iiz_m) = Ac_ms    (1:3, iix_m, iiy_m, iiz_m)
           Ac_ms    (1:3, iix_m, iiy_m, iiz_m) = Ac_new_ms(1:3, iix_m, iiy_m, iiz_m)
           Ac_new_ms(1:3, iix_m, iiy_m, iiz_m) = 0d0
-        end do
-      end do
-    end do
+       end do
+       end do
+       end do
 !$omp end parallel do
+    endif
 
 !$omp parallel do collapse(3) default(shared) private(iix_m, iiy_m, iiz_m)
-    do iiz_m = nz1_m, nz2_m
-      do iiy_m = ny1_m, ny2_m
-        do iix_m = nx1_m, nx2_m
+       do iiz_m = nz1_m, nz2_m
+       do iiy_m = ny1_m, ny2_m
+       do iix_m = nx1_m, nx2_m
           Jm_old_ms(1:3, iix_m, iiy_m, iiz_m) = Jm_ms    (1:3, iix_m, iiy_m, iiz_m)
           Jm_ms    (1:3, iix_m, iiy_m, iiz_m) = Jm_new_ms(1:3, iix_m, iiy_m, iiz_m)
           Jm_new_ms(1:3, iix_m, iiy_m, iiz_m) = 0d0
-        end do
-      end do
-    end do
+       end do
+       end do
+       end do
 !$omp end parallel do
 
 !$omp parallel do default(shared) private(iimacro, iix_m, iiy_m, iiz_m)
@@ -666,20 +658,36 @@ contains
   subroutine assign_mp_variables_omp()
     implicit none
     integer :: iix_m, iiy_m, iiz_m, iimacro
+
+    if(flag_use_E_B) then
 !$omp parallel do default(shared) private(iimacro, iix_m, iiy_m, iiz_m)
-    do iimacro = 1, nmacro
-      iix_m = macropoint(1, iimacro)
-      iiy_m = macropoint(2, iimacro)
-      iiz_m = macropoint(3, iimacro)
-      !! Assign the vector potential into the local macropoint variables
-      !Ac_m(1:3, iimacro) = Ac_ms(1:3, iix_m, iiy_m, iiz_m)
-      !Ac_new_m(1:3, iimacro) = Ac_new_ms(1:3, iix_m, iiy_m, iiz_m)
-      !Ac_old_m(1:3, iimacro) = Ac_old_ms(1:3, iix_m, iiy_m, iiz_m)
-      Ac_m(1:3, iimacro)     = matmul(trans_mat(1:3,1:3),Ac_ms(    1:3, iix_m, iiy_m, iiz_m))
-      Ac_new_m(1:3, iimacro) = matmul(trans_mat(1:3,1:3),Ac_new_ms(1:3, iix_m, iiy_m, iiz_m))
-      Ac_old_m(1:3, iimacro) = matmul(trans_mat(1:3,1:3),Ac_old_ms(1:3, iix_m, iiy_m, iiz_m))
-    end do
+       do iimacro = 1, nmacro
+          iix_m = macropoint(1,iimacro)
+          iiy_m = macropoint(2,iimacro)
+          iiz_m = macropoint(3,iimacro)
+          !! Assign the E and H field into the local macropoint variables
+          E_m(1:3,iimacro) = matmul(trans_mat(1:3,1:3),E_ms(1:3,iix_m,iiy_m,iiz_m))
+          B_m(1:3,iimacro) = matmul(trans_mat(1:3,1:3),B_ms(1:3,iix_m,iiy_m,iiz_m))
+       end do
 !$omp end parallel do
+
+    else
+!$omp parallel do default(shared) private(iimacro, iix_m, iiy_m, iiz_m)
+       do iimacro = 1, nmacro
+          iix_m = macropoint(1, iimacro)
+          iiy_m = macropoint(2, iimacro)
+          iiz_m = macropoint(3, iimacro)
+          !! Assign the vector potential into the local macropoint variables
+          !Ac_m(1:3, iimacro) = Ac_ms(1:3, iix_m, iiy_m, iiz_m)
+          !Ac_new_m(1:3, iimacro) = Ac_new_ms(1:3, iix_m, iiy_m, iiz_m)
+          !Ac_old_m(1:3, iimacro) = Ac_old_ms(1:3, iix_m, iiy_m, iiz_m)
+          Ac_m(1:3, iimacro)     = matmul(trans_mat(1:3,1:3),Ac_ms(    1:3, iix_m, iiy_m, iiz_m))
+          Ac_new_m(1:3, iimacro) = matmul(trans_mat(1:3,1:3),Ac_new_ms(1:3, iix_m, iiy_m, iiz_m))
+          Ac_old_m(1:3, iimacro) = matmul(trans_mat(1:3,1:3),Ac_old_ms(1:3, iix_m, iiy_m, iiz_m))
+       end do
+!$omp end parallel do
+    endif
+
   end subroutine assign_mp_variables_omp
   
   
@@ -689,7 +697,11 @@ contains
 !$omp parallel do default(shared) private(iimacro)
     do iimacro = nmacro_s, nmacro_e
       !! Store data_local_Ac, data_local_Jm
-      data_local_Ac(1:3, iimacro, iter) = Ac_m(1:3, iimacro)
+      if(flag_use_E_B) then
+         data_local_Ac(1:3,iimacro,iter) = E_m(1:3,iimacro)
+      else
+         data_local_Ac(1:3,iimacro,iter) = Ac_m(1:3,iimacro)
+      endif
       data_local_jm(1:3, iimacro, iter) = Jm_m(1:3, iimacro)
     end do
 !$omp end parallel do
@@ -706,10 +718,28 @@ contains
     iproc = mod(index, nproc_size_global)
     ipos = (index - iproc) / nproc_size_global
     if (iproc == nproc_id_global) then
+    if(flag_use_E_B) then
 !$omp parallel do collapse(3) default(shared) private(iiy_m, iix_m, iiz_m)
-      do iiz_m = nz1_m, nz2_m
+        do iiz_m = nz1_m, nz2_m
         do iiy_m = ny1_m, ny2_m
-          do iix_m = nx1_m, nx2_m
+        do iix_m = nx1_m, nx2_m
+            data_out(1:3,  iix_m,iiy_m,iiz_m,ipos) = Ac_ms(1:3,iix_m,iiy_m,iiz_m)
+            data_out(4:6,  iix_m,iiy_m,iiz_m,ipos) = E_ms(1:3, iix_m,iiy_m,iiz_m)
+            data_out(7:9,  iix_m,iiy_m,iiz_m,ipos) = B_ms(1:3, iix_m,iiy_m,iiz_m)
+            data_out(10:12,iix_m,iiy_m,iiz_m,ipos) =Jm_ms(1:3, iix_m,iiy_m,iiz_m)
+            data_out(13,   iix_m,iiy_m,iiz_m,ipos) = Energy_elec_ms(iix_m,iiy_m,iiz_m)
+            data_out(14,   iix_m,iiy_m,iiz_m,ipos) = Energy_joule_ms(iix_m,iiy_m,iiz_m)
+            data_out(15,   iix_m,iiy_m,iiz_m,ipos) = Energy_elemag_ms(iix_m,iiy_m,iiz_m)
+        end do
+        end do
+        end do
+!$omp end parallel do
+
+    else
+!$omp parallel do collapse(3) default(shared) private(iiy_m, iix_m, iiz_m)
+        do iiz_m = nz1_m, nz2_m
+        do iiy_m = ny1_m, ny2_m
+        do iix_m = nx1_m, nx2_m
             data_out(1:3, iix_m, iiy_m, iiz_m, ipos) = Ac_ms(1:3, iix_m, iiy_m, iiz_m)
             data_out(4:6, iix_m, iiy_m, iiz_m, ipos) = Elec_ms(1:3, iix_m, iiy_m, iiz_m)
             data_out(7:9, iix_m, iiy_m, iiz_m, ipos) = Bmag_ms(1:3, iix_m, iiy_m, iiz_m)
@@ -717,10 +747,11 @@ contains
             data_out(13, iix_m, iiy_m, iiz_m, ipos) = Energy_elec_ms(iix_m, iiy_m, iiz_m)
             data_out(14, iix_m, iiy_m, iiz_m, ipos) = Energy_joule_ms(iix_m, iiy_m, iiz_m)
             data_out(15, iix_m, iiy_m, iiz_m, ipos) = Energy_elemag_ms(iix_m, iiy_m, iiz_m)
-          end do
         end do
-      end do
+        end do
+        end do
 !$omp end parallel do
+    end if
     end if
   end subroutine
   
@@ -804,8 +835,13 @@ contains
     implicit none
     ! Export the Ac field of detecting point
     if(comm_is_root(nproc_id_global)) then
-      data_vac_Ac(1:3, 1, iter) = Ac_ms(1:3,ix_detect_l,iy_detect,iz_detect)
-      data_vac_Ac(1:3, 2, iter) = Ac_ms(1:3,ix_detect_r,iy_detect,iz_detect)
+    if(flag_use_E_B) then
+       data_vac_Ac(1:3, 1, iter) = E_ms(1:3,ix_detect_l,iy_detect,iz_detect)
+       data_vac_Ac(1:3, 2, iter) = E_ms(1:3,ix_detect_r,iy_detect,iz_detect)
+    else
+       data_vac_Ac(1:3, 1, iter) = Ac_ms(1:3,ix_detect_l,iy_detect,iz_detect)
+       data_vac_Ac(1:3, 2, iter) = Ac_ms(1:3,ix_detect_r,iy_detect,iz_detect)
+    end if
     end if
   end subroutine store_data_vac_ac
   
@@ -919,29 +955,54 @@ contains
         
           write(fh_ac_m, "('#',1X,A,':',3(1X,I6))") "Macropoint", macropoint(1:3, iimacro)
           write(fh_ac_m, '("#",1X,A,":",1X,A)') "Jm", "Matter current density"
-          write(fh_ac_m, '("#",1X,A,":",1X,A)') "Ac", "External vector potential field"
+          if(flag_use_E_B) then
+             write(fh_ac_m, '("#",1X,A,":",1X,A)') "E", "External electric field"
+          else
+             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Ac", "External vector potential field"
+          endif
           write(fh_ac_m, '("#",1X,A,":",1X,A)') "Tmp_ion", "Temperature"
 
+          if(flag_use_E_B) then
+             write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
+                  & 1, "Time", trim(t_unit_time%name), &
+                  & 2, "E_x", trim(t_unit_elec%name), &
+                  & 3, "E_y", trim(t_unit_elec%name), &
+                  & 4, "E_z", trim(t_unit_elec%name), &
+                  & 5, "Jm_x", trim(t_unit_current%name), &
+                  & 6, "Jm_y", trim(t_unit_current%name), &
+                  & 7, "Jm_z", trim(t_unit_current%name), &
+                  & 8, "Tmp_ion", "K"
+             write(fh_ac_m,*)
+             do iiter = 0, Nt
+                write(fh_ac_m, "(F16.8,7(1X,ES22.14E3,1X))",advance='no') &
+                     & iiter * dt * t_unit_time%conv, &
+                     & data_local_Ac(1:3, iimacro, iiter) * t_unit_elec%conv, &
+                     & data_local_jm(1:3, iimacro, iiter) * t_unit_current%conv, &
+                     & data_local_Tmp_ion(iimacro, iiter)
+                write(fh_ac_m,*)
+             end do !iiter
 
-          write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
-          & 1, "Time", trim(t_unit_time%name), &
-          & 2, "Ac_x", trim(t_unit_ac%name), &
-          & 3, "Ac_y", trim(t_unit_ac%name), &
-          & 4, "Ac_z", trim(t_unit_ac%name), &
-          & 5, "Jm_x", trim(t_unit_current%name), &
-          & 6, "Jm_y", trim(t_unit_current%name), &
-          & 7, "Jm_z", trim(t_unit_current%name), &
-          & 8, "Tmp_ion", "K"
-          write(fh_ac_m,*)
-          do iiter = 0, Nt
-            write(fh_ac_m, "(F16.8,7(1X,ES22.14E3,1X))",advance='no') &
-            & iiter * dt * t_unit_time%conv, &
-            & data_local_Ac(1:3, iimacro, iiter) * t_unit_ac%conv, &
-            & data_local_jm(1:3, iimacro, iiter) * t_unit_current%conv, &
-            & data_local_Tmp_ion(iimacro, iiter)
-            write(fh_ac_m,*)
-          end do !iiter
+          else
+             write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
+                  & 1, "Time", trim(t_unit_time%name), &
+                  & 2, "Ac_x", trim(t_unit_ac%name), &
+                  & 3, "Ac_y", trim(t_unit_ac%name), &
+                  & 4, "Ac_z", trim(t_unit_ac%name), &
+                  & 5, "Jm_x", trim(t_unit_current%name), &
+                  & 6, "Jm_y", trim(t_unit_current%name), &
+                  & 7, "Jm_z", trim(t_unit_current%name), &
+                  & 8, "Tmp_ion", "K"
+             write(fh_ac_m,*)
+             do iiter = 0, Nt
+                write(fh_ac_m, "(F16.8,7(1X,ES22.14E3,1X))",advance='no') &
+                     & iiter * dt * t_unit_time%conv, &
+                     & data_local_Ac(1:3, iimacro, iiter) * t_unit_ac%conv, &
+                     & data_local_jm(1:3, iimacro, iiter) * t_unit_current%conv, &
+                     & data_local_Tmp_ion(iimacro, iiter)
+                write(fh_ac_m,*)
+             end do !iiter
 
+          endif
           close(fh_ac_m)
 
           endif !<--if(imacro.ge.nmacro_s .and. imacro.le.nmacro_e)
@@ -966,32 +1027,56 @@ contains
           fh_ac_m = open_filehandle(file_ac_m)
 
           write(fh_ac_m, '("#",1X,A)') "Local variable at macro point"
-        
           write(fh_ac_m, "('#',1X,A,':',3(1X,I6))") "Macropoint", macropoint(1:3, iimacro)
-          write(fh_ac_m, '("#",1X,A,":",1X,A)') "Jm", "Matter current density"
-          write(fh_ac_m, '("#",1X,A,":",1X,A)') "Ac", "External vector potential field"
-          write(fh_ac_m, '("#",1X,A,":",1X,A)') "Tmp_ion", "Temperature"
 
+          if(flag_use_E_B) then
+             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Jm", "Matter current density"
+             write(fh_ac_m, '("#",1X,A,":",1X,A)') "E", "External electric field"
+             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Tmp_ion", "Temperature"
 
-          write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
-          & 1, "Time", trim(t_unit_time%name), &
-          & 2, "Ac_x", trim(t_unit_ac%name), &
-          & 3, "Ac_y", trim(t_unit_ac%name), &
-          & 4, "Ac_z", trim(t_unit_ac%name), &
-          & 5, "Jm_x", trim(t_unit_current%name), &
-          & 6, "Jm_y", trim(t_unit_current%name), &
-          & 7, "Jm_z", trim(t_unit_current%name), &
-          & 8, "Tmp_ion", "K"
-          write(fh_ac_m,*)
-          do iiter = 0, Nt
-            write(fh_ac_m, "(F16.8,7(1X,E23.15E3,1X))",advance='no') &
-            & iiter * dt * t_unit_time%conv, &
-            & data_local_Ac(1:3, iimacro, iiter) * t_unit_ac%conv, &
-            & data_local_jm(1:3, iimacro, iiter) * t_unit_current%conv, &
-            & data_local_Tmp_ion(iimacro, iiter)
-            write(fh_ac_m,*)
-          end do !iiter
+             write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
+                  & 1, "Time", trim(t_unit_time%name), &
+                  & 2, "E_x", trim(t_unit_elec%name), &
+                  & 3, "E_y", trim(t_unit_elec%name), &
+                  & 4, "E_z", trim(t_unit_elec%name), &
+                  & 5, "Jm_x", trim(t_unit_current%name), &
+                  & 6, "Jm_y", trim(t_unit_current%name), &
+                  & 7, "Jm_z", trim(t_unit_current%name), &
+                  & 8, "Tmp_ion", "K"
+             write(fh_ac_m,*)
+             do iiter = 0, Nt
+                write(fh_ac_m, "(F16.8,7(1X,E23.15E3,1X))",advance='no') &
+                     & iiter * dt * t_unit_time%conv, &
+                     & data_local_Ac(1:3, iimacro, iiter) * t_unit_elec%conv, &
+                     & data_local_jm(1:3, iimacro, iiter) * t_unit_current%conv, &
+                     & data_local_Tmp_ion(iimacro, iiter)
+                write(fh_ac_m,*)
+             end do !iiter
 
+          else
+             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Jm", "Matter current density"
+             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Ac", "External vector potential field"
+             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Tmp_ion", "Temperature"
+
+             write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
+                  & 1, "Time", trim(t_unit_time%name), &
+                  & 2, "Ac_x", trim(t_unit_ac%name), &
+                  & 3, "Ac_y", trim(t_unit_ac%name), &
+                  & 4, "Ac_z", trim(t_unit_ac%name), &
+                  & 5, "Jm_x", trim(t_unit_current%name), &
+                  & 6, "Jm_y", trim(t_unit_current%name), &
+                  & 7, "Jm_z", trim(t_unit_current%name), &
+                  & 8, "Tmp_ion", "K"
+             write(fh_ac_m,*)
+             do iiter = 0, Nt
+                write(fh_ac_m, "(F16.8,7(1X,E23.15E3,1X))",advance='no') &
+                     & iiter * dt * t_unit_time%conv, &
+                     & data_local_Ac(1:3, iimacro, iiter) * t_unit_ac%conv, &
+                     & data_local_jm(1:3, iimacro, iiter) * t_unit_current%conv, &
+                     & data_local_Tmp_ion(iimacro, iiter)
+                write(fh_ac_m,*)
+             end do !iiter
+          endif
           close(fh_ac_m)
 
           endif !<--if(imacro.ge.nmacro_s .and. imacro.le.nmacro_e)
@@ -1016,26 +1101,52 @@ contains
     if (comm_is_root(nproc_id_global)) then
       write(file_ac_vac,"(A, A, '_Ac_vac.data')") trim(dir_ms_RT_Ac),trim(SYSname)
       fh_ac_vac = open_filehandle(file_ac_vac)
-      write(fh_ac_vac, '("#",1X,A)') "Ac vacuum region"
-      write(fh_ac_vac, '("#",1X,A)') "Data of Ac field at the end of media"
+
+
+      if(flag_use_E_B) then
+         write(fh_ac_vac, '("#",1X,A)') "E(t) vacuum region"
+         write(fh_ac_vac, '("#",1X,A)') "Data of E(t) field at the end of media"
       
-      write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "L", ix_detect_l, iy_detect, iz_detect
-      write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "R", ix_detect_r, iy_detect, iz_detect
+         write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "L", ix_detect_l, iy_detect, iz_detect
+         write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "R", ix_detect_r, iy_detect, iz_detect
       
-      write(fh_ac_vac, '("#",99(1X,I0,":",A,"[",A,"]"))') &
-        & 1, "Time", trim(t_unit_time%name), &
-        & 2, "Ac_x(L)", trim(t_unit_ac%name), &
-        & 3, "Ac_y(L)", trim(t_unit_ac%name), &
-        & 4, "Ac_z(L)", trim(t_unit_ac%name), &
-        & 5, "Ac_x(R)", trim(t_unit_ac%name), &
-        & 6, "Ac_y(R)", trim(t_unit_ac%name), &
-        & 7, "Ac_z(R)", trim(t_unit_ac%name)
-      do iiter = 0, Nt
-        write(fh_ac_vac, "(F16.8,6(1X,E23.15E3,1X))") &
-          & iiter * dt * t_unit_time%conv, &
-          & data_vac_Ac(1:3, 1, iiter) * t_unit_ac%conv, &
-          & data_vac_Ac(1:3, 2, iiter) * t_unit_ac%conv
-      end do
+         write(fh_ac_vac, '("#",99(1X,I0,":",A,"[",A,"]"))') &
+              & 1, "Time", trim(t_unit_time%name), &
+              & 2, "E_x(L)", trim(t_unit_elec%name), &
+              & 3, "E_y(L)", trim(t_unit_elec%name), &
+              & 4, "E_z(L)", trim(t_unit_elec%name), &
+              & 5, "E_x(R)", trim(t_unit_elec%name), &
+              & 6, "E_y(R)", trim(t_unit_elec%name), &
+              & 7, "E_z(R)", trim(t_unit_elec%name)
+         do iiter = 0, Nt
+            write(fh_ac_vac, "(F16.8,6(1X,E23.15E3,1X))") &
+                 & iiter * dt * t_unit_time%conv, &
+                 & data_vac_Ac(1:3, 1, iiter) * t_unit_elec%conv, &
+                 & data_vac_Ac(1:3, 2, iiter) * t_unit_elec%conv
+         end do
+
+      else
+         write(fh_ac_vac, '("#",1X,A)') "Ac vacuum region"
+         write(fh_ac_vac, '("#",1X,A)') "Data of Ac field at the end of media"
+      
+         write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "L", ix_detect_l, iy_detect, iz_detect
+         write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "R", ix_detect_r, iy_detect, iz_detect
+      
+         write(fh_ac_vac, '("#",99(1X,I0,":",A,"[",A,"]"))') &
+              & 1, "Time", trim(t_unit_time%name), &
+              & 2, "Ac_x(L)", trim(t_unit_ac%name), &
+              & 3, "Ac_y(L)", trim(t_unit_ac%name), &
+              & 4, "Ac_z(L)", trim(t_unit_ac%name), &
+              & 5, "Ac_x(R)", trim(t_unit_ac%name), &
+              & 6, "Ac_y(R)", trim(t_unit_ac%name), &
+              & 7, "Ac_z(R)", trim(t_unit_ac%name)
+         do iiter = 0, Nt
+            write(fh_ac_vac, "(F16.8,6(1X,E23.15E3,1X))") &
+                 & iiter * dt * t_unit_time%conv, &
+                 & data_vac_Ac(1:3, 1, iiter) * t_unit_ac%conv, &
+                 & data_vac_Ac(1:3, 2, iiter) * t_unit_ac%conv
+         end do
+      endif
       close(fh_ac_vac)
     end if
     call comm_sync_all  
@@ -1254,7 +1365,11 @@ contains
     integer :: ia,imacro,imol
     real(8) :: Eem
 
-    Et(:)= -(Ac_new_m(:,imacro)-Ac_old_m(:,imacro))/(2*dt)
+    if(flag_use_E_B) then
+       Et(:)= E_m(:,imacro)
+    else
+       Et(:)= -(Ac_new_m(:,imacro)-Ac_old_m(:,imacro))/(2*dt)
+    endif
     Eem  = aLxyz*sum(Et(:)**2)/(8.d0*Pi)
 
     Rion(:,:)     = Rion_m(:,:,imacro)
@@ -1297,8 +1412,8 @@ contains
 
   end subroutine
 
-
 end subroutine cmd_maxwell_ms
+
 
 !===========================================================
 subroutine dt_evolve_Ac_1d_cmd
@@ -1311,6 +1426,13 @@ subroutine dt_evolve_Ac_1d_cmd
 
   iz_m = nz_origin_m
   iy_m = ny_origin_m
+
+
+  !Memo:
+  !Ac does not become zero after pulse ends, probably because 
+  !the error accumurates during the numerical integration by time? be carefull.
+  if(flag_use_light_source) call apply_light_source_1d_J
+
 !$omp parallel do default(shared) private(ix_m,rr)
   do ix_m = nx1_m, nx2_m
     rr(1) = 0d0
@@ -1324,9 +1446,297 @@ subroutine dt_evolve_Ac_1d_cmd
   end do
 !$omp end parallel do
 
+  if(flag_use_absorb_bound) call apply_absorb_bound_1d_Ac
+  
   return
+
+contains 
+
+  subroutine  apply_absorb_bound_1d_Ac
+     if(ABC_method=="Mur") then
+        call  apply_absorb_bound_1d_Mur_Ac
+     else
+        stop
+     endif
+  end subroutine
+
+  subroutine  apply_absorb_bound_1d_Mur_Ac   ! 1-th Mur
+    implicit none
+    integer :: ix1,ix2, iy, iz
+    real(8) :: tmp
+
+    iy = ny_origin_m
+    iz = nz_origin_m
+
+    tmp = ( c_light * dt - HX_m ) / ( c_light * dt + HX_m )
+
+    !right absorbing boundary
+    ix1=nx2_m
+    ix2=nx2_m-1
+    Ac_new_ms(:,ix1,iy,iz) = Ac_ms(:,ix2,iy,iz) + tmp* ( Ac_new_ms(:,ix2,iy,iz) - Ac_ms(:,ix1,iy,iz))
+
+    !left absorbing boundary
+    ix1=nx1_m
+    ix2=nx1_m+1
+    Ac_new_ms(:,ix1,iy,iz) = Ac_ms(:,ix2,iy,iz) + tmp* ( Ac_new_ms(:,ix2,iy,iz) - Ac_ms(:,ix1,iy,iz))
+
+  end subroutine apply_absorb_bound_1d_Mur_Ac
+
 end subroutine dt_evolve_Ac_1d_cmd
 
 !===========================================================
+subroutine dt_evolve_EB_1d_cmd
+  use Global_variables
+  implicit none
+  integer :: ix_m,iy_m,iz_m
+  real(8) :: coef1E,coef2E,coef1B,coef2B
+
+  iy_m = ny_origin_m
+  iz_m = nz_origin_m
+
+!  !test
+!  E_ms(1,:,:,:)=0d0
+!  B_ms(1,:,:,:)=0d0
+!  E_m(1,:)=0d0
+!  B_m(1,:)=0d0
+
+  if(flag_use_light_source) call apply_light_source_1d_J
+
+  if(flag_use_absorb_bound)then
+     if(ABC_method=="Mur") then
+        E_last(:,nx1_m:nx1_m+1,iy_m,iz_m) = E_ms(:,nx1_m:nx1_m+1,iy_m,iz_m)
+        E_last(:,nx2_m-1:nx2_m,iy_m,iz_m) = E_ms(:,nx2_m-1:nx2_m,iy_m,iz_m)
+        B_last(:,nx1_m:nx1_m+1,iy_m,iz_m) = B_ms(:,nx1_m:nx1_m+1,iy_m,iz_m)
+        B_last(:,nx2_m-1:nx2_m,iy_m,iz_m) = B_ms(:,nx2_m-1:nx2_m,iy_m,iz_m)
+     else if(ABC_method=="PML") then
+        E_last(:,:,iy_m,iz_m) = E_ms(:,:,iy_m,iz_m)
+        B_last(:,:,iy_m,iz_m) = B_ms(:,:,iy_m,iz_m)
+     endif
+  endif
+
+  coef1E = c_light*dt /HX_m
+  coef2E = 4*pi*dt
+  coef1B = c_light*dt /HX_m
+
+!$omp parallel do default(shared) private(ix_m)
+  do ix_m = nx1_m, nx2_m
+     E_ms(2,ix_m,iy_m,iz_m) = E_ms(2,ix_m,iy_m,iz_m) - coef1E * (B_ms(3,ix_m,iy_m,iz_m)-B_ms(3,ix_m-1,iy_m,iz_m)) &
+                            & +Jm_ms(2,ix_m,iy_m,iz_m)*coef2E
+     E_ms(3,ix_m,iy_m,iz_m) = E_ms(3,ix_m,iy_m,iz_m) + coef1E * (B_ms(2,ix_m,iy_m,iz_m)-B_ms(2,ix_m-1,iy_m,iz_m)) &
+                            & +Jm_ms(3,ix_m,iy_m,iz_m)*coef2E
+  end do
+!$omp end parallel do
+
+  if(flag_use_absorb_bound) call apply_absorb_bound_1d_E
+
+!$omp parallel do default(shared) private(ix_m)
+  do ix_m = nx1_m, nx2_m
+     B_ms(2,ix_m,iy_m,iz_m) = B_ms(2,ix_m,iy_m,iz_m) + coef1B*(E_ms(3,ix_m+1,iy_m,iz_m)-E_ms(3,ix_m,iy_m,iz_m))
+     B_ms(3,ix_m,iy_m,iz_m) = B_ms(3,ix_m,iy_m,iz_m) - coef1B*(E_ms(2,ix_m+1,iy_m,iz_m)-E_ms(2,ix_m,iy_m,iz_m))
+  end do
+!$omp end parallel do
+
+  if(flag_use_absorb_bound) call apply_absorb_bound_1d_B
+
+contains 
+
+  subroutine  apply_absorb_bound_1d_E
+     if(     ABC_method=="Mur") then
+        call  apply_absorb_bound_1d_Mur_E
+     else if(ABC_method=="PML") then
+        call  apply_absorb_bound_1d_PML_E
+     else
+        stop
+     endif
+  end subroutine
+
+  subroutine  apply_absorb_bound_1d_B
+     if(     ABC_method=="Mur") then
+        call  apply_absorb_bound_1d_Mur_B
+     else if(ABC_method=="PML") then
+        call  apply_absorb_bound_1d_PML_B
+     else
+        stop
+     endif
+  end subroutine
+
+  !----------------------------------------------------------------------------------------
+  subroutine  apply_absorb_bound_1d_Mur_E   ! 1-th Mur
+    implicit none
+    integer :: ix1,ix2, iy, iz
+    real(8) :: tmp
+
+    iy = ny_origin_m
+    iz = nz_origin_m
+    tmp = ( c_light * dt - HX_m ) / ( c_light * dt + HX_m )
+
+    !!right absorbing boundary
+    !ix1=nx2_m
+    !ix2=nx2_m-1
+    !E_ms(:,ix1,iy,iz) = E_last(:,ix2,iy,iz) + tmp* ( E_ms(:,ix2,iy,iz) - E_last(:,ix1,iy,iz))
+
+    !left absorbing boundary
+    ix1=nx1_m
+    ix2=nx1_m+1
+    E_ms(:,ix1,iy,iz) = E_last(:,ix2,iy,iz) + tmp* ( E_ms(:,ix2,iy,iz) - E_last(:,ix1,iy,iz))
+
+  end subroutine apply_absorb_bound_1d_Mur_E
+
+  subroutine  apply_absorb_bound_1d_Mur_B   ! 1-th Mur
+    implicit none
+    integer :: ix1,ix2, iy, iz
+    real(8) :: tmp
+
+    iy = ny_origin_m
+    iz = nz_origin_m
+    tmp = ( c_light * dt - HX_m ) / ( c_light * dt + HX_m )
+
+    !right absorbing boundary
+    ix1=nx2_m
+    ix2=nx2_m-1
+    B_ms(:,ix1,iy,iz) = B_last(:,ix2,iy,iz) + tmp* ( B_ms(:,ix2,iy,iz) - B_last(:,ix1,iy,iz))
+
+    !!left absorbing boundary
+    !ix1=nx1_m
+    !ix2=nx1_m+1
+    !B_ms(:,ix1,iy,iz) = B_last(:,ix2,iy,iz) + tmp* ( B_ms(:,ix2,iy,iz) - B_last(:,ix1,iy,iz))
+
+  end subroutine apply_absorb_bound_1d_Mur_B
+
+  !----------------------------------------------------------------------------------------
+  subroutine  apply_absorb_bound_1d_PML_E
+    implicit none
+    integer :: ix,iy,iz
+    real(8) :: pi2dt, sgmE_pml
+
+    iy = ny_origin_m
+    iz = nz_origin_m
+
+    pi2dt = 2d0 * pi * dt
+
+!$omp parallel do default(shared) private(ix,sgmE_pml,coef1E,coef2E)
+    do ix = nx1_m, nx1_pml
+       sgmE_pml = sgm_max_E_pml * (dble(nx1_pml-ix)/dble(nx_pml))**M_pml
+       coef1E = ( 1d0 - pi2dt * sgmE_pml ) / ( 1d0 + pi2dt * sgmE_pml )
+       coef2E = c_light * dt / HX_m / ( 1d0 + pi2dt * sgmE_pml )
+       E_ms(2,ix,iy,iz) = coef1E * E_last(2,ix,iy,iz) - coef2E * (B_ms(3,ix,iy,iz)-B_ms(3,ix-1,iy,iz))
+       E_ms(3,ix,iy,iz) = coef1E * E_last(3,ix,iy,iz) + coef2E * (B_ms(2,ix,iy,iz)-B_ms(2,ix-1,iy,iz))
+    end do
+!$omp end parallel do
+
+!$omp parallel do default(shared) private(ix,sgmE_pml,coef1E,coef2E)
+    do ix = nx2_pml, nx2_m
+       sgmE_pml = sgm_max_E_pml * (dble(ix-nx2_pml)/dble(nx_pml))**M_pml
+       coef1E = ( 1d0 - pi2dt * sgmE_pml ) / ( 1d0 + pi2dt * sgmE_pml )
+       coef2E = c_light * dt / HX_m / ( 1d0 + pi2dt * sgmE_pml )
+       E_ms(2,ix,iy,iz) = coef1E * E_last(2,ix,iy,iz) - coef2E * (B_ms(3,ix,iy,iz)-B_ms(3,ix-1,iy,iz))
+       E_ms(3,ix,iy,iz) = coef1E * E_last(3,ix,iy,iz) + coef2E * (B_ms(2,ix,iy,iz)-B_ms(2,ix-1,iy,iz))
+    end do
+!$omp end parallel do
+
+    E_ms(:,nx1_m,iy,iz) = 0d0
+   !E_ms(:,nx2_m,iy,iz) = 0d0
+
+  end subroutine
+
+  subroutine  apply_absorb_bound_1d_PML_B
+    implicit none
+    integer :: ix,iy,iz
+    real(8) :: tmp, sgmH_pml
+
+    iy = ny_origin_m
+    iz = nz_origin_m
+
+    tmp = c_light**2 * dt / (8d0 * pi)
+
+!$omp parallel do default(shared) private(ix,sgmH_pml,coef1B,coef2B)
+    do ix = nx1_m, nx1_pml-1
+       sgmH_pml = sgm_max_B_pml * (dble(nx1_pml-(ix+0.5d0))/dble(nx_pml))**M_pml
+       coef1B = ( 1d0 - tmp * sgmH_pml ) / ( 1d0 + tmp * sgmH_pml )
+       coef2B = c_light * dt / HX_m / ( 1d0 + tmp * sgmH_pml )
+       B_ms(2,ix,iy,iz) = coef1B*B_last(2,ix,iy,iz) + coef2B*(E_ms(3,ix+1,iy,iz)-E_ms(3,ix,iy,iz))
+       B_ms(3,ix,iy,iz) = coef1B*B_last(3,ix,iy,iz) - coef2B*(E_ms(2,ix+1,iy,iz)-E_ms(2,ix,iy,iz))
+    end do
+!$omp end parallel do
+
+!$omp parallel do default(shared) private(ix,sgmH_pml,coef1B,coef2B)
+    do ix = nx2_pml, nx2_m
+       sgmH_pml = sgm_max_B_pml * (dble((ix+0.5d0)-nx2_pml)/dble(nx_pml))**M_pml
+       coef1B = ( 1d0 - tmp * sgmH_pml ) / ( 1d0 + tmp * sgmH_pml )
+       coef2B = c_light * dt / HX_m / ( 1d0 + tmp * sgmH_pml )
+       B_ms(2,ix,iy,iz) = coef1B*B_last(2,ix,iy,iz) + coef2B*(E_ms(3,ix+1,iy,iz)-E_ms(3,ix,iy,iz))
+       B_ms(3,ix,iy,iz) = coef1B*B_last(3,ix,iy,iz) - coef2B*(E_ms(2,ix+1,iy,iz)-E_ms(2,ix,iy,iz))
+    end do
+!$omp end parallel do
+
+   !B_ms(:,nx1_m,iy,iz) = 0d0
+    B_ms(:,nx2_m,iy,iz) = 0d0
+
+  end subroutine
+
+end subroutine dt_evolve_EB_1d_cmd
+
+!===========================================================
+subroutine apply_light_source_1d_J
+  use Global_variables
+  implicit none
+  integer :: iy,iz
+  real(8) :: E0inc_abs, E0inc(3)
+  real(8) :: time,t1_s,t1_e, env,func_inc1
+
+  iy = ny_origin_m
+  iz = nz_origin_m
+
+  E0inc_abs = 5.338d-9*sqrt(rlaser_int_wcm2_1)   ! electric field in a.u.
+  E0inc(:)  = E0inc_abs * epdir_re1(:)
+
+  time = (iter_save-1)*dt
+
+  if(ae_shape1=="Acos2")then
+     t1_s = t1_delay
+     t1_e = t1_delay + pulse_tw1
+     env = 0d0
+     if(time.ge.t1_s .and. time.le.t1_e) env = sin((time-t1_s)/pulse_tw1*pi)**2
+     func_inc1 = env * cos(omega1*((time-t1_s-pulse_tw1*0.5d0)))
+
+  else if(ae_shape1=="Acos4")then
+     t1_s = t1_delay
+     t1_e = t1_delay + pulse_tw1
+     env = 0d0
+     if(time.ge.t1_s .and. time.le.t1_e) env = sin((time-t1_s)/pulse_tw1*pi)**4
+     func_inc1 = env * cos(omega1*((time-t1_s-pulse_tw1*0.5d0)))
+
+  else if(ae_shape1=="Agauss")then
+  
+  else
+     stop
+  endif
+
+  Jm_ms(:,ix_light_source,iy,iz) = c_light/(2d0*pi*HX_m) * E0inc(:) * func_inc1
+
+end subroutine apply_light_source_1d_J
+
+subroutine  init_absorb_bound_1d_PML_EB
+  implicit none
+  real(8) :: tmp_pi2dt, tmp_coef
+
+  !nx_pml = 50 !
+  !M_pml  = 4  !2-4 usually
+  !R_pml  = 1d-6
+  sgm_max_E_pml = - (log(R_pml)) *(M_pml+1)/(2d0 * HX_m*nx_pml * (4d0*pi/c_light) )
+  sgm_max_B_pml = sgm_max_E_pml * (4*pi/c_light)**2
+
+  nx1_pml = nx1_m + nx_pml -1
+  nx2_pml = nx2_m - nx_pml +1
+
+  if(comm_is_root(nproc_id_global)) write(*,*) "sgm_max_E_pml= ", real(sgm_max_E_pml)
+  tmp_pi2dt = 2d0 * pi * dt
+  tmp_coef  = (1d0 - tmp_pi2dt * sgm_max_E_pml)/(1d0 + tmp_pi2dt * sgm_max_E_pml)
+  if(tmp_coef.lt.0d0) then
+     if(comm_is_root(nproc_id_global)) write(*,*) "Error: coef is negative", real(tmp_coef)
+     stop
+  endif
+  
+end subroutine
 
 end module

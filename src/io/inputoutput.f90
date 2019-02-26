@@ -2014,7 +2014,8 @@ contains
     else if(iperiodic==3.and.domain_parallel=='n') then
       if(convergence.ne.'rho_dne') call stop_by_bad_input2('iperiodic','convergence')
       if(abs(t1_delay).ge.1d-10)then
-         if(index(ae_shape1,'Acos')==0) call stop_by_bad_input2('t1_delay','ae_shape1')
+        !if(index(ae_shape1,'Acos')==0) call stop_by_bad_input2('t1_delay','ae_shape1')
+         if(index(ae_shape1,'Agauss')==0 .and. index(ae_shape1,'Acos')==0) call stop_by_bad_input2('t1_delay','ae_shape1')
       endif
     endif
       
