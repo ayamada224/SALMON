@@ -33,7 +33,10 @@ module control_ms_cmd
   real(8),allocatable :: E_ms(:,:,:,:), B_ms(:,:,:,:)
   real(8),allocatable :: E_m(:,:), B_m(:,:)
   real(8),allocatable :: E_last(:,:,:,:), B_last(:,:,:,:)
+  real(8),allocatable :: D1_pml(:,:,:,:), D2_pml(:,:,:,:)
+  real(8),allocatable :: D1_last(:,:,:,:),D2_last(:,:,:,:)
   real(8) :: R_pml, sgm_max_E_pml, sgm_max_B_pml
+  real(8) :: a_pml
   character(3) :: ABC_method
 
 contains
@@ -64,7 +67,8 @@ subroutine init_cmd_maxwell_ms
      stop
   endif
 
-  flag_use_E_B = .true.  !test hoge
+!  flag_use_E_B = .true.  !test hoge
+  flag_use_E_B = .false.  !test hoge
   if(flag_use_E_B) then
      if(comm_is_root(nproc_id_global)) write(*,*) "flag_use_E_B= ", flag_use_E_B
      allocate( E_ms(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
@@ -116,6 +120,7 @@ subroutine init_cmd_maxwell_ms
   call comm_bcast(flag_fix_atoms_md,    nproc_group_global)
   call comm_bcast(flag_use_absorb_bound,nproc_group_global)
   call comm_bcast(flag_use_light_source,nproc_group_global)
+  call comm_bcast(ix_light_source,      nproc_group_global)
   call comm_bcast(ABC_method,           nproc_group_global)
   call comm_bcast(R_pml,                nproc_group_global)
   call comm_bcast(M_pml,                nproc_group_global)
@@ -325,7 +330,7 @@ subroutine cmd_maxwell_ms
     endif
 
     if(flag_use_absorb_bound .and. ABC_method=="PML") &
-    call init_absorb_bound_1d_PML_EB
+    call init_absorb_bound_1d_PML
     
     deallocate(zu_t)
 
@@ -370,15 +375,15 @@ subroutine cmd_maxwell_ms
      jav(:) = 0d0  !for initial step
      if (comm_is_root(nproc_id_tdks)) then
          jm_new_m_tmp(1:3,imacro) = jav(1:3)
-      end if
-   enddo
-   call comm_summation(jm_new_m_tmp,Jm_m,3*nmacro,nproc_group_global)
-   do imacro = 1, nmacro
-      ix_m = macropoint(1,imacro)
-      iy_m = macropoint(2,imacro)
-      iz_m = macropoint(3,imacro)
-      Jm_ms(1:3,ix_m,iy_m,iz_m) = matmul(trans_inv(1:3,1:3),Jm_m(1:3,imacro))
-   enddo
+     end if
+  enddo
+  call comm_summation(jm_new_m_tmp,Jm_m,3*nmacro,nproc_group_global)
+  do imacro = 1, nmacro
+     ix_m = macropoint(1,imacro)
+     iy_m = macropoint(2,imacro)
+     iz_m = macropoint(3,imacro)
+     Jm_ms(1:3,ix_m,iy_m,iz_m) = matmul(trans_inv(1:3,1:3),Jm_m(1:3,imacro))
+  enddo
 
    !Enh_gkTlns = 0d0
    !Enh        = 0d0
@@ -387,8 +392,6 @@ subroutine cmd_maxwell_ms
    !   Qnh = gkT * thermostat_tau**2d0
    !endif
 
-
-  call timer_begin(LOG_DYNAMICS)
 
   RTiteratopm : do iter=entrance_iter+1, Nt
 
@@ -409,9 +412,13 @@ subroutine cmd_maxwell_ms
     !! Calculate "iter+1" macroscopic field (Ac_new_ms, Jm_new_ms)
     iter_save=iter
     if(flag_use_E_B) then
-       call dt_evolve_EB_1d_cmd() ! Timer: LOG_DT_EVOLVE_AC
+       call dt_evolve_EB_1d_cmd() 
     else
-       call dt_evolve_Ac_1d_cmd() ! Timer: LOG_DT_EVOLVE_AC
+       if(flag_use_absorb_bound .and. ABC_method=="PML") then
+          call dt_evolve_Ac_1d_cmd_PML()
+       else
+          call dt_evolve_Ac_1d_cmd() 
+       endif
     endif
 
 
@@ -434,24 +441,29 @@ subroutine cmd_maxwell_ms
     call store_data_vac_ac()
     !! Store data_out variables
     if (flg_out_ms_step) then !! mod(iter, out_ms_step) == 0
-      index = iter / out_ms_step
-      call store_data_out_omp(index)
+       index = iter / out_ms_step
+       if(.not. flag_ms_ff_LessPrint) then !AY
+          call store_data_out_omp(index)
+          call write_data_out(index) !now moved to here
+       endif
     end if
 
 
     if (flg_out_ms_step .and. comm_is_root(nproc_id_global)) then
-      !call trace_ms_calculation()
-      write(*,'(1X,A,I6,A,I6)') 'Multiscale iter =', iter, '/', Nt
+       if(flag_use_E_B) then
+          write(*,'(1X,A,I6,A,I6)') 'Multiscale iter =', iter, '/', Nt
+       else
+          call trace_ms_calculation()
+       endif
     end if
 
 
     !! Update of the Microscopic System
     
     !! NOTE: flg_out_ms_step (the macroscopic field will exported in next step)
-    flg_out_ms_next_step = .false.
-    if (mod(iter+1, out_ms_step) == 0) then
-      flg_out_ms_next_step = .true.
-    end if
+    flg_out_ms_next_step=.false.
+    if( mod(iter+1, out_ms_step)==0 ) flg_out_ms_next_step=.true.
+
 
     Macro_loop : do imacro = nmacro_s, nmacro_e
       
@@ -467,11 +479,12 @@ subroutine cmd_maxwell_ms
       !! NOTE: This condition will be removed and replaced by FDTD mode
       !!       after merging the common Maxwell calculation routine.
       if (debug_switch_no_radiation) jav(:)=0d0
-      
+
+      jav(1)=0d0  !force to zero for propagation direction
       if (comm_is_root(nproc_id_tdks)) then
         jm_new_m_tmp(1:3,imacro) = jav(1:3)
       end if
-      javt(iter+1,:) = jav(:)
+      javt(iter+1,:) = jav(:)  !not use?
 
       ! force
       aforce(:,:) = force_m(:,:,imacro)
@@ -510,7 +523,7 @@ subroutine cmd_maxwell_ms
       !! Map the local macropoint current into the jm field
       !Jm_new_ms(1:3, ix_m, iy_m, iz_m) = Jm_new_ms(1:3, ix_m, iy_m, iz_m) & 
       !                               & + Jm_new_m(1:3, imacro)
-      Jm_new_ms(1:3, ix_m, iy_m, iz_m) = matmul(trans_inv(1:3,1:3), Jm_new_m(1:3, imacro))
+      Jm_new_ms(1:3,ix_m,iy_m,iz_m) = matmul(trans_inv(1:3,1:3), Jm_new_m(1:3,imacro))
     end do
 !$omp end parallel do
 
@@ -539,10 +552,10 @@ subroutine cmd_maxwell_ms
           enddo
        endif
     endif
+
     !===========================================================================
     
   enddo RTiteratopm !end of RT iteraction========================
-
 
 
   if(comm_is_root(nproc_id_global)) then
@@ -552,12 +565,13 @@ subroutine cmd_maxwell_ms
 
   if(comm_is_root(nproc_id_global)) write(*,*) 'This is the start of write section'
 
-  ! Write data out by using MPI
-  if(.not. flag_ms_ff_LessPrint) then !AY
-     do index = 0, Ndata_out-1
-        call write_data_out(index)
-     end do
-  endif  
+  !!!xxxx move into the do loop of time later hoge 
+  !! Write data out by using MPI
+  !if(.not. flag_ms_ff_LessPrint) then !AY
+  !   do index = 0, Ndata_out-1
+  !      call write_data_out(index)
+  !   end do
+  !endif  
   call write_data_local_ac_jm()
   call write_data_vac_ac()
 
@@ -776,13 +790,14 @@ contains
     integer :: iproc, ipos
     
     iproc = mod(index, nproc_size_global)
-    ipos = (index - iproc) / nproc_size_global
+    ipos  = (index - iproc) / nproc_size_global
+
     if (iproc == nproc_id_global) then
       write(file_ac, "(A,A,'_Ac_',I6.6,'.data')") & 
         & trim(dir_ms_RT_Ac), trim(SYSname),  out_ms_step * index
       fh_ac = open_filehandle(file_ac)
+
       write(fh_ac, '("#",1X,A)') "Macroscopic field distribution"
-      
       write(fh_ac, '("#",1X,A,":",1X,A)') "IX,IY,IZ", "Coordinate"
       write(fh_ac, '("#",1X,A,":",1X,A)') "Ac", "Vector potential field"
       write(fh_ac, '("#",1X,A,":",1X,A)') "E", "Electric field"
@@ -793,18 +808,18 @@ contains
       write(fh_ac, '("#",1X,A,":",1X,A)') "Eemf", "Total EM field energy"
 
       write(fh_ac, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
-        & 1, "Ix", "none", &
-        & 2, "Iy", "none", &
-        & 3, "Iz", "none", &
-        & 4, "Ac_x", "a.u.", & !!, trim(t_unit_ac%name), &
-        & 5, "Ac_y", "a.u.", & !!, trim(t_unit_ac%name), &
-        & 6, "Ac_z", "a.u.", & !!, trim(t_unit_ac%name), &
-        & 7, "E_x", "a.u.", & !!, trim(t_unit_current%name), &
-        & 8, "E_y", "a.u.", & !!, trim(t_unit_current%name), &
-        & 9, "E_z", "a.u.", & !!, trim(t_unit_current%name), &
-        & 10, "B_x", "a.u.", & !!, trim(t_unit_current%name), &
-        & 11, "B_y", "a.u.", & !!, trim(t_unit_current%name), &
-        & 12, "B_z", "a.u.", & !!, trim(t_unit_current%name), &
+        & 1,  "Ix", "none", &
+        & 2,  "Iy", "none", &
+        & 3,  "Iz", "none", &
+        & 4,  "Ac_x", "a.u.", & !!, trim(t_unit_ac%name), &
+        & 5,  "Ac_y", "a.u.", & !!, trim(t_unit_ac%name), &
+        & 6,  "Ac_z", "a.u.", & !!, trim(t_unit_ac%name), &
+        & 7,  "E_x",  "a.u.", & !!, trim(t_unit_current%name), &
+        & 8,  "E_y",  "a.u.", & !!, trim(t_unit_current%name), &
+        & 9,  "E_z",  "a.u.", & !!, trim(t_unit_current%name), &
+        & 10, "B_x",  "a.u.", & !!, trim(t_unit_current%name), &
+        & 11, "B_y",  "a.u.", & !!, trim(t_unit_current%name), &
+        & 12, "B_z",  "a.u.", & !!, trim(t_unit_current%name), &
         & 13, "Jm_x", "a.u.", & !!, trim(t_unit_current%name), &
         & 14, "Jm_y", "a.u.", & !!, trim(t_unit_current%name), &
         & 15, "Jm_z", "a.u.", & !!, trim(t_unit_current%name), &
@@ -815,14 +830,14 @@ contains
 
       !! TODO: Support the automatic unit-system conversion of _ac.data files
       do iiz_m = nz1_m, nz2_m
-        do iiy_m = ny1_m, ny2_m
-          do iix_m = nx1_m, nx2_m
-            write(fh_ac,'(I6,1X,I6,1X,I6,99(1X,E23.15E3))',advance='no')  &
+      do iiy_m = ny1_m, ny2_m
+      do iix_m = nx1_m, nx2_m
+         write(fh_ac,'(I6,1X,I6,1X,I6,99(1X,E23.15E3))',advance='no')  &
               & iix_m, iiy_m, iiz_m, &
               & data_out(1:ndata_out_column, iix_m, iiy_m, iiz_m, ipos)
-            write(fh_ac,*)
-          end do
-        end do
+         write(fh_ac,*)
+      end do
+      end do
       end do
       close(fh_ac)
     end if
@@ -1414,6 +1429,94 @@ contains
 
 end subroutine cmd_maxwell_ms
 
+!===========================================================
+subroutine dt_evolve_Ac_1d_cmd_PML
+  use Global_variables
+  implicit none
+  integer :: ix, iy, iz
+  real(8) :: sgm_pml, tmp1, coef1A,coef2A,rr(3)
+
+  iy = ny_origin_m
+  iz = nz_origin_m
+
+  !Memo:
+  !Ac does not become zero after pulse ends, probably because 
+  !the error accumurates during the numerical integration by time? be carefull.
+  if(flag_use_light_source) call apply_light_source_1d_J
+
+  ! Reference:
+  ! D.Zhou,et al., IEEE Photo. Tech. Lett. 13, 1041 (2001) 
+  ! Y. S. Rickard, et al. IEEE Tran. Anten. Prop., 51, 286, (2003)
+
+  ! D1_pml: ix means ix+1/2, it means it+1/2
+  ! D2_pml: ix means ix, it means it+1/2
+  D1_last(:,:,:,:) = D1_pml(:,:,:,:)
+  D2_last(:,:,:,:) = D2_pml(:,:,:,:)
+  call comm_sync_all
+
+  !update for D1
+!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
+  do ix = nx1_m, nx2_m
+     if(ix.lt.nx1_pml) then
+        sgm_pml = sgm_max_E_pml * (dble(nx1_pml-(ix+0.5d0))/dble(nx_pml))**M_pml
+     else if(ix.ge.nx2_pml) then
+        sgm_pml = sgm_max_E_pml * (dble((ix+0.5d0)-nx2_pml)/dble(nx_pml))**M_pml
+     else
+        sgm_pml = 0d0
+     endif
+
+     tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
+     coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
+     coef2A  = dt/HX_m/tmp1
+     D1_pml(:,ix,iy,iz) = coef1A *D1_last(:,ix,iy,iz) + coef2A *(Ac_ms(:,ix+1,iy,iz) - Ac_ms(:,ix,iy,iz))
+  enddo
+!$omp end parallel do
+
+  call comm_sync_all
+
+  !update for D2
+!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
+  do ix = nx1_m, nx2_m
+     if(ix.le.nx1_pml) then
+        sgm_pml = sgm_max_E_pml * (dble(nx1_pml-ix)/dble(nx_pml))**M_pml
+     else if(ix.ge.nx2_pml) then
+        sgm_pml = sgm_max_E_pml * (dble(ix-nx2_pml)/dble(nx_pml))**M_pml
+     else
+        sgm_pml = 0d0
+     endif
+
+     tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
+     coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
+     coef2A  = 1d0/HX_m/tmp1
+     D2_pml(:,ix,iy,iz) = coef1A *D2_last(:,ix,iy,iz)   &
+                 + coef2A *( (D1_pml(:,ix,iy,iz) - D1_pml(:,ix-1,iy,iz))    &
+                           - (D1_last(:,ix,iy,iz)- D1_last(:,ix-1,iy,iz)) )
+  enddo
+!$omp end parallel do
+
+  call comm_sync_all
+
+  !update for Ac
+!$omp parallel do default(shared) private(ix,coef1A,coef2A,rr)
+  do ix = nx1_m, nx2_m
+
+     coef1A = 4d0*pi*dt*dt
+     coef2A = (c_light*dt)**2
+
+     rr(:) = ( D2_pml(:,ix,iy,iz) - D2_last(:,ix,iy,iz) ) / dt
+     rr(1) = 0d0
+
+     Ac_new_ms(:,ix,iy,iz) = 2d0 * Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz) &
+                           & -Jm_ms(:,ix,iy,iz) * coef1A + rr(:)*coef2A
+  enddo
+!$omp end parallel do
+
+    !termination
+    Ac_new_ms(:,nx1_m,iy,iz) = 0d0
+    Ac_new_ms(:,nx2_m,iy,iz) = 0d0
+
+
+end subroutine dt_evolve_Ac_1d_cmd_PML
 
 !===========================================================
 subroutine dt_evolve_Ac_1d_cmd
@@ -1426,7 +1529,6 @@ subroutine dt_evolve_Ac_1d_cmd
 
   iz_m = nz_origin_m
   iy_m = ny_origin_m
-
 
   !Memo:
   !Ac does not become zero after pulse ends, probably because 
@@ -1453,10 +1555,10 @@ subroutine dt_evolve_Ac_1d_cmd
 contains 
 
   subroutine  apply_absorb_bound_1d_Ac
-     if(ABC_method=="Mur") then
+     if(     ABC_method=="Mur") then
         call  apply_absorb_bound_1d_Mur_Ac
-     else
-        stop
+     else if(ABC_method=="PML") then
+        call  apply_absorb_bound_1d_PML_Ac
      endif
   end subroutine
 
@@ -1482,7 +1584,179 @@ contains
 
   end subroutine apply_absorb_bound_1d_Mur_Ac
 
+  subroutine  apply_absorb_bound_1d_PML_Ac
+    !! this is PML for wave equation or scalar FDTD 
+    !!(D.Zhou,et al., IEEE Photo. Tech. Lett. 13, 1041 (2001))
+    implicit none
+    integer :: ix,iy,iz
+    real(8) :: sgm_pml, tmp1,coef1A, coef2A
+
+    iy = ny_origin_m
+    iz = nz_origin_m
+
+    ! D1_pml: ix means ix+1/2, it means it+1/2
+    ! D2_pml: ix means ix, it means it+1/2
+
+    D1_last(:,:,:,:) = D1_pml(:,:,:,:)
+    D2_last(:,:,:,:) = D2_pml(:,:,:,:)
+
+!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
+    do ix = nx1_m, nx2_m
+       if(ix.lt.nx1_pml) then
+          sgm_pml = sgm_max_E_pml * (dble(nx1_pml-(ix+0.5d0))/dble(nx_pml))**M_pml
+       else if(ix.ge.nx2_pml) then
+          sgm_pml = sgm_max_E_pml * (dble((ix+0.5d0)-nx2_pml)/dble(nx_pml))**M_pml
+       else
+          sgm_pml = 0d0
+       endif
+       tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
+       coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
+       coef2A  = dt/HX_m/tmp1 !* c_light
+       D1_pml(:,ix,iy,iz) = coef1A *D1_last(:,ix,iy,iz) + coef2A *(Ac_ms(:,ix+1,iy,iz) - Ac_ms(:,ix,iy,iz))
+    enddo
+!$omp end parallel do
+
+!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
+    do ix = nx1_m, nx2_m
+       if(ix.le.nx1_pml) then
+          sgm_pml = sgm_max_E_pml * (dble(nx1_pml-ix)/dble(nx_pml))**M_pml
+       else if(ix.ge.nx2_pml) then
+          sgm_pml = sgm_max_E_pml * (dble(ix-nx2_pml)/dble(nx_pml))**M_pml
+       else
+          sgm_pml = 0d0
+       endif
+       tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
+       coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
+       coef2A  = 1d0/HX_m/tmp1
+       D2_pml(:,ix,iy,iz) = coef1A *D2_last(:,ix,iy,iz)   &
+                    + coef2A *( (D1_pml(:,ix,iy,iz) - D1_pml(:,ix-1,iy,iz))    &
+                              - (D1_last(:,ix,iy,iz)- D1_last(:,ix-1,iy,iz)) )
+    enddo
+!$omp end parallel do
+
+!$omp parallel do default(shared) private(ix,coef1A)
+    do ix = nx1_m, nx1_pml
+       coef1A = c_light * dt  * c_light
+       Ac_new_ms(:,ix,iy,iz) = 2d0*Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz) &
+            &  + coef1A * (D2_pml(:,ix,iy,iz)-D2_last(:,ix,iy,iz))
+    enddo
+!$omp end parallel do
+
+!$omp parallel do default(shared) private(ix,coef1A)
+    do ix = nx2_pml, nx2_m
+       coef1A = c_light * dt  * c_light
+       Ac_new_ms(:,ix,iy,iz) = 2d0*Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz) &
+            &  + coef1A * (D2_pml(:,ix,iy,iz)-D2_last(:,ix,iy,iz))
+    enddo
+!$omp end parallel do
+
+    !termination
+    Ac_new_ms(:,nx1_m,iy,iz) = 0d0
+    Ac_new_ms(:,nx2_m,iy,iz) = 0d0
+
+return
+!-------------------------------------------------------
+
+!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
+    do ix = nx1_m, nx1_pml
+       sgm_pml = sgm_max_E_pml * (dble(nx1_pml-ix)/dble(nx_pml))**M_pml
+       tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
+       coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
+       coef2A  = dt/HX_m/tmp1 !* c_light
+       D1_pml(:,ix,iy,iz) = coef1A *D1_last(:,ix,iy,iz) + coef2A *(Ac_ms(:,ix+1,iy,iz) - Ac_ms(:,ix,iy,iz))
+    enddo
+!$omp end parallel do
+
+!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
+    do ix = nx1_m, nx1_pml
+       sgm_pml = sgm_max_E_pml * (dble(nx1_pml-ix)/dble(nx_pml))**M_pml
+       tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
+       coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
+       coef2A  = 1d0/HX_m/tmp1
+       D2_pml(:,ix,iy,iz) = coef1A *D2_last(:,ix,iy,iz)   &
+                    + coef2A *( (D1_pml(:,ix,iy,iz) - D1_pml(:,ix-1,iy,iz))    &
+                              - (D1_last(:,ix,iy,iz)- D1_last(:,ix-1,iy,iz)) )
+    enddo
+!$omp end parallel do
+
+!$omp parallel do default(shared) private(ix,coef1A)
+    do ix = nx1_m, nx1_pml
+       coef1A = c_light * dt  * c_light
+       Ac_new_ms(:,ix,iy,iz) = 2d0*Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz) &
+            &  + coef1A * (D2_pml(:,ix,iy,iz)-D2_last(:,ix,iy,iz))
+    enddo
+!$omp end parallel do
+
+    !termination
+!    Ac_new_ms(:,nx1_m,iy,iz) = 0d0
+!    Ac_new_ms(:,nx2_m,iy,iz) = 0d0
+
+  end subroutine
+
+  subroutine  apply_absorb_bound_1d_PML_Ac_NowWork 
+    !! usual simple PML style for vector potential, but it did not work well
+    implicit none
+    integer :: ix,iy,iz
+    real(8) :: sgmE_pml,sgmH_pml, rr(3)
+    real(8) :: tmp1,coef1A, coef2A, coef3A, coef4A, coef5A
+
+    iy = ny_origin_m
+    iz = nz_origin_m
+
+!$omp parallel do default(shared) private(ix,sgmE_pml,sgmH_pml,tmp1,rr,coef1A,coef2A,coef3A,coef4A,coef5A)
+    do ix = nx1_m, nx1_pml
+       tmp1 = (dble(nx1_pml-ix)/dble(nx_pml))**M_pml
+       sgmE_pml = sgm_max_E_pml * tmp1
+      !tmp1 = (dble(nx1_pml-(ix+0.5d0))/dble(nx_pml))**M_pml  !test
+       sgmH_pml = sgm_max_B_pml * tmp1
+
+       coef1A = 1d0/(c_light**2 * dt)
+       coef2A = sgmH_pml/(4d0*pi) + 4d0*pi*sgmE_pml/c_light**2
+       coef3A = sgmE_pml * sgmH_pml * dt
+       coef4A = 4.0*pi*dt/c_light**2
+       coef5A = 1d0 / ( coef1A + 0.5d0*coef2A )
+
+       rr(1) = 0d0
+       rr(2:3) = (   Ac_ms(2:3,ix+1,iy,iz) &
+            & -2d0 * Ac_ms(2:3,ix,  iy,iz) &
+            &      + Ac_ms(2:3,ix-1,iy,iz) ) / HX_m**2
+       Ac_new_ms(:,ix,iy,iz) = coef5A * ( coef1A* (2d0*Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz)) &
+            &  + rr(:)*dt + 0.5d0*coef2A * Ac_old_ms(:,ix,iy,iz) - coef3A * Ac_ms(:,ix,iy,iz)     &
+            &  - coef4A * Jm_ms(:,ix,iy,iz) )
+    end do
+!$omp end parallel do
+
+!$omp parallel do default(shared) private(ix,sgmE_pml,sgmH_pml,tmp1,rr,coef1A,coef2A,coef3A,coef4A,coef5A)
+    do ix = nx2_pml, nx2_m
+       tmp1 = (dble(ix-nx2_pml)/dble(nx_pml))**M_pml
+       sgmE_pml = sgm_max_E_pml * tmp1
+      !tmp1 =  (dble((ix+0.5d0)-nx2_pml)/dble(nx_pml))**M_pml  !test
+       sgmH_pml = sgm_max_B_pml * tmp1
+
+       coef1A = 1d0/(c_light**2 * dt)
+       coef2A = sgmH_pml/(4d0*pi) + 4d0*pi*sgmE_pml/c_light**2
+       coef3A = sgmE_pml * sgmH_pml * dt
+       coef4A = 4.0*pi*dt/c_light**2
+       coef5A = 1d0 / ( coef1A + 0.5d0*coef2A )
+
+       rr(1) = 0d0
+       rr(2:3) = (   Ac_ms(2:3,ix+1,iy,iz) &
+            & -2d0 * Ac_ms(2:3,ix,  iy,iz) &
+            &      + Ac_ms(2:3,ix-1,iy,iz) ) / HX_m**2
+       Ac_new_ms(:,ix,iy,iz) = coef5A * ( coef1A* (2d0*Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz)) &
+            &  + rr(:)*dt + 0.5d0*coef2A * Ac_old_ms(:,ix,iy,iz) - coef3A * Ac_ms(:,ix,iy,iz)     &
+            &  - coef4A * Jm_ms(:,ix,iy,iz) )
+    end do
+!$omp end parallel do
+
+    !termination
+    Ac_new_ms(:,nx1_m,iy,iz) = 0d0
+    Ac_new_ms(:,nx2_m,iy,iz) = 0d0
+
+  end subroutine
+
 end subroutine dt_evolve_Ac_1d_cmd
+
 
 !===========================================================
 subroutine dt_evolve_EB_1d_cmd
@@ -1520,10 +1794,10 @@ subroutine dt_evolve_EB_1d_cmd
 
 !$omp parallel do default(shared) private(ix_m)
   do ix_m = nx1_m, nx2_m
-     E_ms(2,ix_m,iy_m,iz_m) = E_ms(2,ix_m,iy_m,iz_m) - coef1E * (B_ms(3,ix_m,iy_m,iz_m)-B_ms(3,ix_m-1,iy_m,iz_m)) &
-                            & +Jm_ms(2,ix_m,iy_m,iz_m)*coef2E
-     E_ms(3,ix_m,iy_m,iz_m) = E_ms(3,ix_m,iy_m,iz_m) + coef1E * (B_ms(2,ix_m,iy_m,iz_m)-B_ms(2,ix_m-1,iy_m,iz_m)) &
-                            & +Jm_ms(3,ix_m,iy_m,iz_m)*coef2E
+     E_ms(2,ix_m,iy_m,iz_m) =  E_ms(2,ix_m,iy_m,iz_m) - coef1E * (B_ms(3,ix_m,iy_m,iz_m)-B_ms(3,ix_m-1,iy_m,iz_m)) &
+                          & + Jm_ms(2,ix_m,iy_m,iz_m) * coef2E
+     E_ms(3,ix_m,iy_m,iz_m) =  E_ms(3,ix_m,iy_m,iz_m) + coef1E * (B_ms(2,ix_m,iy_m,iz_m)-B_ms(2,ix_m-1,iy_m,iz_m)) &
+                          & + Jm_ms(3,ix_m,iy_m,iz_m) * coef2E
   end do
 !$omp end parallel do
 
@@ -1716,13 +1990,25 @@ subroutine apply_light_source_1d_J
 
 end subroutine apply_light_source_1d_J
 
-subroutine  init_absorb_bound_1d_PML_EB
+subroutine  init_absorb_bound_1d_PML
   implicit none
+!  integer :: ix
   real(8) :: tmp_pi2dt, tmp_coef
+
+  if(.not. flag_use_E_B) then
+     allocate( D1_pml( 1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+     allocate( D2_pml( 1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+     allocate( D1_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+     allocate( D2_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+     D1_pml(:,:,:,:)=0d0
+     D2_pml(:,:,:,:)=0d0
+     a_pml = 1d0  !parameter, now set to 1 according to the paper
+  endif
 
   !nx_pml = 50 !
   !M_pml  = 4  !2-4 usually
   !R_pml  = 1d-6
+
   sgm_max_E_pml = - (log(R_pml)) *(M_pml+1)/(2d0 * HX_m*nx_pml * (4d0*pi/c_light) )
   sgm_max_B_pml = sgm_max_E_pml * (4*pi/c_light)**2
 
@@ -1736,7 +2022,12 @@ subroutine  init_absorb_bound_1d_PML_EB
      if(comm_is_root(nproc_id_global)) write(*,*) "Error: coef is negative", real(tmp_coef)
      stop
   endif
-  
+!  if(comm_is_root(nproc_id_global))then
+!    do ix = nx1_m, nx1_pml
+!       write(*,*) "#sgm:",ix,real(sgm_max_E_pml * (dble(nx1_pml-ix)/dble(nx_pml))**M_pml)
+!    enddo
+! endif
+
 end subroutine
 
 end module
