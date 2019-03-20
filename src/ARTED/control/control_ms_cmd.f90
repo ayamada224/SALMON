@@ -28,11 +28,12 @@ module control_ms_cmd
   integer :: iter_save, ix_light_source
   integer :: M_pml,nx_pml, nx1_pml,nx2_pml
   real(8),allocatable :: Rion_eq0(:,:) 
-  real(8),allocatable :: Qai_ms(:,:,:), Rxyz_wX_ms(:,:,:,:)
+  real(8),allocatable :: Qai_ms(:,:,:), Qai_old_ms(:,:,:), Rxyz_wX_ms(:,:,:,:)
   real(8),allocatable :: Uene_ms(:), Tene_ms(:), Eall_ms(:)
   real(8),allocatable :: E_ms(:,:,:,:), B_ms(:,:,:,:)
   real(8),allocatable :: E_m(:,:), B_m(:,:)
   real(8),allocatable :: E_last(:,:,:,:), B_last(:,:,:,:)
+  real(8),allocatable :: E_last_m(:,:)
   real(8),allocatable :: D1_pml(:,:,:,:), D2_pml(:,:,:,:)
   real(8),allocatable :: D1_last(:,:,:,:),D2_last(:,:,:,:)
   real(8) :: R_pml, sgm_max_E_pml, sgm_max_B_pml
@@ -77,6 +78,7 @@ subroutine init_cmd_maxwell_ms
      allocate( B_m(1:3,1:nmacro) )
      allocate( E_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
      allocate( B_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+     allocate( E_last_m(1:3,1:nmacro) )
   endif
 
   !(read input no.1)
@@ -239,6 +241,7 @@ subroutine init_cmd_maxwell_ms
 
   !allocation for multi-scale
   allocate( Qai_ms(4,nmol,nmacro_s:nmacro_e) )
+  allocate( Qai_old_ms(4,nmol,nmacro_s:nmacro_e) )
   allocate( Rxyz_wX_ms(3,4,nmol,nmacro_s:nmacro_e) )
   allocate( Uene_ms(nmacro_s:nmacro_e) )
   allocate( Tene_ms(nmacro_s:nmacro_e) )
@@ -290,7 +293,6 @@ subroutine cmd_maxwell_ms
   use salmon_file
   use misc_routines
   use inputoutput, only: t_unit_time, t_unit_current, t_unit_ac, t_unit_elec
-  use restart, only: prep_restart_write
 
   implicit none
   integer :: iter, ix_m, iy_m, iz_m, imacro,igroup,i, index
@@ -304,48 +306,63 @@ subroutine cmd_maxwell_ms
   call opt_vars_init_t4ppt()
 #endif
 
+  !(unnecessary)
+  deallocate( dRion, dRion_m )
+  deallocate( javt )
+
+  !
   allocate( Mt_ms(3,nmacro_s:nmacro_e) )
 
-!hoge
-!xxx make later  call take_back_mol_into_ucell_ms
+  do imacro = nmacro_s, nmacro_e
+     call take_back_mol_into_ucell_ms(imacro)
+  enddo
 
 
-  if (restart_option == 'restart') then
-    !position_option='asis'
-  else if(restart_option == 'new')then
-    !Rion_update_rt = rion_update_on
+  !Rion_update_rt = rion_update_on
 
-    if(comm_is_root(nproc_id_global)) then
-      write(*,*) 'This is the end of preparation for Real time calculation'
-      call timer_show_current_hour('elapse time=',LOG_ALL)
-      write(*,*) '-----------------------------------------------------------'
-    end if
+  if(comm_is_root(nproc_id_global)) then
+     write(*,*) 'This is the end of preparation for Real time calculation'
+     call timer_show_current_hour('elapse time=',LOG_ALL)
+     write(*,*) '-----------------------------------------------------------'
+  end if
 
 !====RT calculation============================
 
-    if(flag_use_light_source) then
-       if(comm_is_root(nproc_id_global)) write(*,*) "use light source"
-    else
-      call init_Ac_ms
-    endif
+  if(flag_use_light_source) then
+     if(comm_is_root(nproc_id_global)) write(*,*) "use light source"
+  else
+     call init_Ac_ms
+  endif
 
-    if(flag_use_absorb_bound .and. ABC_method=="PML") &
-    call init_absorb_bound_1d_PML
+  if(flag_use_absorb_bound .and. ABC_method=="PML") &
+       call init_absorb_bound_1d_PML
     
-    deallocate(zu_t)
+  deallocate(zu_t)
+
+  !(for restarting with read_rt_wfn_k_ms=y option)
+  if(read_rt_wfn_k_ms=='y') then
+     call add_init_Ac_ms
+     call assign_mp_variables_omp()
+     do imacro = 1, nmacro
+        ix_m = macropoint(1,imacro)
+        iy_m = macropoint(2,imacro)
+        iz_m = macropoint(3,imacro)
+        Jm_new_m(1:3,imacro)=matmul(trans_mat(1:3,1:3),Jm_new_ms(1:3,ix_m,iy_m,iz_m))
+     end do
+  endif
 
 !reentrance
 
-    !position_option='rewind'
-    entrance_iter=-1
-    call reset_rt_timer
-  end if
+  !position_option='rewind'
+  entrance_iter=-1
+  call reset_rt_timer
 
   ! create directory for exporting
   call create_dir_ms
 
   do imacro = nmacro_s, nmacro_e
      call cal_force_energy_CRK_MS(imacro)
+     call init_Qai_old_ms(imacro)
   enddo
 
   ! Export to file_trj (initial step)
@@ -424,6 +441,8 @@ subroutine cmd_maxwell_ms
 
     !! Compute EM field, energy and other important quantities...
     call calc_energy_joule()
+    if(flag_use_light_source) &
+    call calc_energy_joule_subtract_light_source() !subtract J of light source 
     if (flg_out_ms_step) then !! mod(iter, out_ms_step) == 0
       call calc_elec_field()
       call calc_bmag_field()
@@ -471,6 +490,14 @@ subroutine cmd_maxwell_ms
       if(.not.flag_fix_atoms_md) &
       call dt_evolve_MD_1_MS(iter,imacro)
 
+      ! force
+      aforce(:,:) = force_m(:,:,imacro)
+      call cal_force_energy_CRK_MS(imacro)
+
+      !! update coordinate and velocity in MD option (part-2)
+      if(.not.flag_fix_atoms_md) &
+      call dt_evolve_MD_2_MS(aforce,iter,imacro)
+
       ! current
       call cal_dipole_moment_current_ms(Mt_ms(:,imacro),jav,dt,imacro)
 
@@ -484,29 +511,21 @@ subroutine cmd_maxwell_ms
       if (comm_is_root(nproc_id_tdks)) then
         jm_new_m_tmp(1:3,imacro) = jav(1:3)
       end if
-      javt(iter+1,:) = jav(:)  !not use?
+      !javt(iter+1,:) = jav(:)  !not use? hoge
 
-      ! force
-      aforce(:,:) = force_m(:,:,imacro)
-      call cal_force_energy_CRK_MS(imacro)
-
-      ! Calculate + store electron energy (if required in the next iteration..)
-      if (flg_out_ms_next_step) then !! mod(iter+1, out_ms_step) == 0
-        if(comm_is_root(nproc_id_tdks)) then ! sato
-          energy_elec_Matter_new_m_tmp(imacro) = Eall - Eall0_m(imacro)
+      ! Calculate + store electron energy
+      if (flg_out_ms_next_step) then !! mod(iter+1,out_ms_step) == 0
+        if(comm_is_root(nproc_id_tdks)) then
+          energy_elec_Matter_new_m_tmp(imacro) = Eall_ms(imacro) - Eall0_m(imacro)
         end if
       end if
-
-      !! update coordinate and velocity in MD option (part-2)
-      if(.not.flag_fix_atoms_md) &
-      call dt_evolve_MD_2_MS(aforce,iter,imacro)
-
 
     end do Macro_loop !end of Macro_loop iteraction========================
 
     !===========================================================================
 
     call comm_summation(jm_new_m_tmp, Jm_new_m, 3 * nmacro, nproc_group_global)
+
     if (flg_out_ms_next_step) then
       call comm_summation(energy_elec_Matter_new_m_tmp, energy_elec_Matter_new_m, nmacro, nproc_group_global)
     end if
@@ -779,6 +798,29 @@ contains
 
     do imacro = nmacro_s, nmacro_e
        call create_directory(dir_ms_M(imacro))
+    enddo
+
+  end subroutine
+
+  subroutine take_back_mol_into_ucell_ms(imacro)
+    implicit none
+    integer j,imol,iatom_c,iatom,ia, imacro
+
+    do imol=1,nmol
+       iatom_c = mol2atom_cnt(imol)
+       do j=1,3
+          if( Rion_m(j,iatom_c,imacro).lt.0d0 ) then
+             do ia= 1,natom_mol(imol)
+                iatom = mol2atom_top(imol) + ia-1
+                Rion_m(j,iatom,imacro) = Rion_m(j,iatom,imacro) + aL(j)
+             enddo
+          else if( Rion_m(j,iatom_c,imacro).gt.aL(j) ) then
+             do ia= 1,natom_mol(imol)
+                iatom = mol2atom_top(imol) + ia-1
+                Rion_m(j,iatom,imacro) = Rion_m(j,iatom,imacro) - aL(j)
+             enddo
+          endif
+       enddo
     enddo
 
   end subroutine
@@ -1281,23 +1323,12 @@ contains
     force(:,:)    = force_m(:,:,imacro)
     Rion(:,:)     = Rion_m(:,:,imacro)
     Rion_eq(:,:)  = Rion_eq_m(:,:,imacro)
-!hoge I want to remove dRion and dRion_m (later)
-    dRion(:,:,iter:iter+1)  = dRion_m(:,:,iter:iter+1,imacro)
-
 
     !!NHC act on velocity with dt/2
     !if(ensemble=="NVT" .and. thermostat=="nose-hoover")then
     !   call apply_nose_hoover_velocity(dt_h)
     !endif
     !update ion velocity with dt/2
-
-    if(iter==0) then
-       dRion(:,:,iter-1)= dRion(:,:,iter) - velocity(:,:)*dt
-       dRion_m(:,:,iter-1,imacro) = dRion(:,:,iter-1)
-    endif
-
-!hoge
-!xxx make later  call take_back_mol_into_ucell_ms
 
     do ia=1,NI
        mass_au = umass*Mass(Kion(ia))
@@ -1313,8 +1344,7 @@ contains
     !update ion coordinate with dt
     do ia=1,NI
        mass_au = umass*Mass(Kion(ia))
-       dRion(:,ia,iter+1) = dRion(:,ia,iter) + velocity(:,ia)*dt
-       Rion(:,ia) = Rion_eq(:,ia) + dRion(:,ia,iter+1)
+       Rion(:,ia) = Rion(:,ia) + velocity(:,ia)*dt
     enddo
 
     !!NHC act on thermostat with dt
@@ -1327,8 +1357,9 @@ contains
 
     velocity_m(:,:,imacro) = velocity(:,:)
     Rion_m(:,:,imacro)     = Rion(:,:)
-    dRion_m(:,:,iter:iter+1,imacro) = dRion(:,:,iter:iter+1)
-    
+
+    call take_back_mol_into_ucell_ms(imacro)
+   
   end subroutine
 
   subroutine dt_evolve_MD_2_MS(aforce,it,imacro)
@@ -1340,7 +1371,6 @@ contains
     dt_h = dt/2d0
     velocity(:,:) = velocity_m(:,:,imacro)
     force(:,:)    = force_m(:,:,imacro)
-    dRion(:,:,it:it+1)  = dRion_m(:,:,it:it+1,imacro)
 
     aforce(:,:) = 0.5d0*( aforce(:,:) + force(:,:) )
 
@@ -1373,21 +1403,40 @@ contains
 
   end subroutine
 
+  subroutine init_Qai_old_ms(imacro)
+    use md_ground_state, only: cal_Tion_Temperature_ion
+    use force_field_CRK, only: Qai
+    implicit none
+    integer :: ia,imacro,imol
+    real(8) :: Tion, Temperature_ion
+
+    do imol=1,nmol
+       Qai_old_ms(:,imol,imacro) = Qai(:,imol)
+    enddo
+
+    velocity(:,:) = velocity_m(:,:,imacro)
+    call cal_Tion_Temperature_ion(Tion,Temperature_ion,velocity)
+    Eall0_m(imacro) = Uene + Tion
+
+  end subroutine
 
   subroutine cal_force_energy_CRK_MS(imacro)
     use force_field_CRK, only: Qai, Rxyz_wX, cal_force_energy_CRK
     implicit none
     integer :: ia,imacro,imol
-    real(8) :: Eem
+   !real(8) :: Eem
 
+    !electric field used in CRK force field
     if(flag_use_E_B) then
-       Et(:)= E_m(:,imacro)
+      !Et(:)= E_m(:,imacro) !unstable to be NaN
+       Et(:)= 0.5d0 * ( E_m(:,imacro) + E_last_m(:,imacro) )
     else
+      !Et(:)= -(Ac_new_m(:,imacro)-Ac_m(:,imacro))/dt   !unstable to be NaN
        Et(:)= -(Ac_new_m(:,imacro)-Ac_old_m(:,imacro))/(2*dt)
     endif
-    Eem  = aLxyz*sum(Et(:)**2)/(8.d0*Pi)
+   !Eem  = aLxyz*sum(Et(:)**2)/(8.d0*Pi)
 
-    Rion(:,:)     = Rion_m(:,:,imacro)
+    Rion(:,:) = Rion_m(:,:,imacro)
     call cal_force_energy_CRK
 
     do ia=1,NI
@@ -1395,11 +1444,16 @@ contains
     enddo
 
     do imol=1,nmol
-       Qai_ms(:,imol,imacro) = Qai(:,imol)
-       Rxyz_wX_ms(:,:,imol,imacro) = Rxyz_wX(:,:,imol)
-       Uene_ms(imacro) = Uene
-       Eall_ms(imacro) = Uene + Eem
+       Qai_old_ms(:,imol,imacro)  = Qai_ms(:,imol,imacro)
     enddo
+
+    do imol=1,nmol
+       Qai_ms(:,imol,imacro) = Qai(:,imol)
+       Rxyz_wX_ms(:,:,imol,imacro)= Rxyz_wX(:,:,imol)
+    enddo
+    Uene_ms(imacro) = Uene
+   !Eall_ms(imacro) = Uene + Eem
+    Eall_ms(imacro) = Uene  !electric field energy is included already(need check)
 
   end subroutine
 
@@ -1408,25 +1462,103 @@ contains
     use force_field_CRK, only: Qai,Rxyz_wX,natom_wX_mol,Vuc
     implicit none
     integer :: imol,ia_wX,imacro
-    real(8) :: dipole_mom(3), dipole_mom_last(3), current_matter(3), dt
+    real(8) :: dipole_mom(3), current_matter(3), dt
+    real(8) :: velocity_wX(3,4,nmol), dQaidt(4,nmol) !, dipole_mom_last(3)
+    
+    !dipole_mom_last(:) = dipole_mom(:)
 
-    dipole_mom_last(:) = dipole_mom(:)
+    do imol=1,nmol
+       dQaidt(:,imol) = (Qai_ms(:,imol,imacro) - Qai_old_ms(:,imol,imacro))/dt
+    enddo
+
+    velocity(:,:) = velocity_m(:,:,imacro)
+    Rion(:,:)     = Rion_m(:,:,imacro)
+    call cal_vel_siteX(velocity_wX)
 
     !dipole moment in unit cell
-    dipole_mom(:) = 0d0
+    dipole_mom(:)    =0d0
+    current_matter(:)=0d0
     do imol=1,nmol
     do ia_wX=1,natom_wX_mol(imol)
        dipole_mom(:) = dipole_mom(:) &
                      + Qai_ms(ia_wX,imol,imacro)*Rxyz_wX_ms(:,ia_wX,imol,imacro)
+       current_matter(:) = current_matter(:) &
+                     -dQaidt(ia_wX,imol) * Rxyz_wX_ms(:,ia_wX,imol,imacro) &
+                     - Qai_ms(ia_wX,imol,imacro) * velocity_wX(:,ia_wX,imol)
     enddo
     enddo
-    dipole_mom(:) = dipole_mom(:)/aLxyz
+    dipole_mom(:)     = dipole_mom(:)/aLxyz
+    current_matter(:) = current_matter(:)/aLxyz
 
-    !matter current defined by positive charge-->minus sign
-    current_matter(:) = -(dipole_mom(:) - dipole_mom_last(:))/dt
+    !matter current defined by positive charge-->minus sign (less accurate/rough)
+    !current_matter(:) = -(dipole_mom(:) - dipole_mom_last(:))/dt
 
   end subroutine
 
+  subroutine  cal_vel_siteX(velocity_wX)
+    use force_field_CRK, only: dist_OX_wat
+    implicit none
+    real(8) :: velocity_wX(3,4,nmol), vel_O(3)
+    integer :: i,j, iO,iH1,iH2,iX1,iX2, iatom_O,iatom_H1,iatom_H2, imol
+    real(8) :: drOH1_x_drOH2(3), drOH1(3), drOH2(3), rOH1, rOH2
+    real(8) :: e_OH1_x_OH2(3), rOH1rOH2, rOH1rOH2_inv, r2_OH1,r2_OH2
+    real(8) :: drOH1_x_drOH2_inv, drOH1_x_drOH2_inv2
+    real(8) :: dot_drOH1(3), dot_drOH2(3)
+    real(8) :: dot_e_OH1_x_OH2(3), dot_drOH1_x_drOH2(3), dot_drOH1_x_drOH2_abs
+    
+    iO =1 !(O atom)
+    iH1=2 !(H1 atom)
+    iH2=3 !(H2 atom)
+
+    iX1=1 !(X1 site)
+    iX2=2 !(X2 site)
+
+    do imol=1,nmol
+
+       iatom_O  = mol2atom_top(imol)
+       iatom_H1 = mol2atom_top(imol) + 1
+       iatom_H2 = mol2atom_top(imol) + 2
+
+       drOH1(:) = Rion(:,iatom_H1) - Rion(:,iatom_O)
+       drOH2(:) = Rion(:,iatom_H2) - Rion(:,iatom_O)
+
+!       r2_OH1  = sum(drOH1(:)*drOH1(:))
+!       r2_OH2  = sum(drOH2(:)*drOH2(:))
+!       rOH1    = sqrt(r2_OH1)
+!       rOH2    = sqrt(r2_OH2)
+!       rOH1rOH2     = rOH1 * rOH2
+!       rOH1rOH2_inv = 1d0/rOH1rOH2
+
+       drOH1_x_drOH2(1)  = drOH1(2)*drOH2(3) - drOH1(3)*drOH2(2)
+       drOH1_x_drOH2(2)  = drOH1(3)*drOH2(1) - drOH1(1)*drOH2(3)
+       drOH1_x_drOH2(3)  = drOH1(1)*drOH2(2) - drOH1(2)*drOH2(1)
+       drOH1_x_drOH2_inv = 1d0/sqrt(sum(drOH1_x_drOH2(:)*drOH1_x_drOH2(:)))
+       drOH1_x_drOH2_inv2= drOH1_x_drOH2_inv * drOH1_x_drOH2_inv
+       e_OH1_x_OH2(:)    = drOH1_x_drOH2(:) * drOH1_x_drOH2_inv
+
+       dot_drOH1(:) = velocity(:,iatom_H1) - velocity(:,iatom_O)
+       dot_drOH2(:) = velocity(:,iatom_H2) - velocity(:,iatom_O)
+       
+       dot_drOH1_x_drOH2(1) = ( drOH1(2)*dot_drOH2(3) + dot_drOH1(2)*drOH2(3) ) &
+                            - ( drOH1(3)*dot_drOH2(2) + dot_drOH1(3)*drOH2(2) )
+       dot_drOH1_x_drOH2(2) = ( drOH1(3)*dot_drOH2(1) + dot_drOH1(3)*drOH2(1) ) &
+                            - ( drOH1(1)*dot_drOH2(3) + dot_drOH1(1)*drOH2(3) )
+       dot_drOH1_x_drOH2(3) = ( drOH1(1)*dot_drOH2(2) + dot_drOH1(1)*drOH2(2) ) &
+                            - ( drOH1(2)*dot_drOH2(1) + dot_drOH1(2)*drOH2(1) )
+
+       dot_drOH1_x_drOH2_abs = sum(drOH1_x_drOH2(:)*dot_drOH1_x_drOH2(:)) * drOH1_x_drOH2_inv
+       dot_e_OH1_x_OH2(:) = dot_drOH1_x_drOH2(:) * drOH1_x_drOH2_inv - drOH1_x_drOH2(:) * dot_drOH1_x_drOH2_abs * drOH1_x_drOH2_inv2
+
+       vel_O(:)              = velocity(:,iatom_O)
+       velocity_wX(:,1,imol) = vel_O(:) + dist_OX_wat * dot_e_OH1_x_OH2(:)  ! X1 site
+       velocity_wX(:,2,imol) = vel_O(:) - dist_OX_wat * dot_e_OH1_x_OH2(:)  ! X2 site
+       velocity_wX(:,3,imol) = velocity(:,iatom_H1)
+       velocity_wX(:,4,imol) = velocity(:,iatom_H2)
+       
+    enddo
+    
+  end subroutine cal_vel_siteX
+  
 end subroutine cmd_maxwell_ms
 
 !===========================================================
@@ -1776,6 +1908,7 @@ subroutine dt_evolve_EB_1d_cmd
 
   if(flag_use_light_source) call apply_light_source_1d_J
 
+  E_last_m(:,:) = E_m(:,:)
   if(flag_use_absorb_bound)then
      if(ABC_method=="Mur") then
         E_last(:,nx1_m:nx1_m+1,iy_m,iz_m) = E_ms(:,nx1_m:nx1_m+1,iy_m,iz_m)
@@ -1953,10 +2086,12 @@ end subroutine dt_evolve_EB_1d_cmd
 !===========================================================
 subroutine apply_light_source_1d_J
   use Global_variables
+  use inputoutput, only: au_time_fs
   implicit none
   integer :: iy,iz
   real(8) :: E0inc_abs, E0inc(3)
-  real(8) :: time,t1_s,t1_e, env,func_inc1
+  real(8) :: time,t1_s,t1_e, env,func_inc1, t_edge
+  real(8) :: omg_chirp, omg_min, omg_region
 
   iy = ny_origin_m
   iz = nz_origin_m
@@ -1966,22 +2101,75 @@ subroutine apply_light_source_1d_J
 
   time = (iter_save-1)*dt
 
+  t1_s = t1_delay
+  t1_e = t1_delay + pulse_tw1
+  env = 0d0
+
   if(ae_shape1=="Acos2")then
-     t1_s = t1_delay
-     t1_e = t1_delay + pulse_tw1
-     env = 0d0
+
      if(time.ge.t1_s .and. time.le.t1_e) env = sin((time-t1_s)/pulse_tw1*pi)**2
      func_inc1 = env * cos(omega1*((time-t1_s-pulse_tw1*0.5d0)))
 
   else if(ae_shape1=="Acos4")then
-     t1_s = t1_delay
-     t1_e = t1_delay + pulse_tw1
-     env = 0d0
+
      if(time.ge.t1_s .and. time.le.t1_e) env = sin((time-t1_s)/pulse_tw1*pi)**4
      func_inc1 = env * cos(omega1*((time-t1_s-pulse_tw1*0.5d0)))
 
-  else if(ae_shape1=="Agauss")then
-  
+  else if(ae_shape1=="CW_edge20fs")then
+
+     t_edge = 20d0 / au_time_fs
+     if(time.ge.t1_s .and. time.le.t1_e) then
+        if(time.ge.t1_s .and. time.le.t1_s + t_edge) then
+           env = sin((time-t1_s)/(2d0*t_edge)*pi)**2
+        else if( time.ge.t1_e - t_edge .and. time.le.t1_e) then
+           env = sin((time-(t1_e-2d0*t_edge))/(2d0*t_edge)*pi)**2
+        else
+           env = 1.0d0
+        endif
+     endif
+     func_inc1 = env * cos(omega1*((time-t1_s-pulse_tw1*0.5d0)))
+
+  else if(ae_shape1=="CW_edge100fs")then
+
+     t_edge = 100d0 / au_time_fs
+     if(time.ge.t1_s .and. time.le.t1_e) then
+        if(time.ge.t1_s .and. time.le.t1_s + t_edge) then
+           env = sin((time-t1_s)/(2d0*t_edge)*pi)**2
+        else if( time.ge.t1_e - t_edge .and. time.le.t1_e) then
+           env = sin((time-(t1_e-2d0*t_edge))/(2d0*t_edge)*pi)**2
+        else
+           env = 1.0d0
+        endif
+     endif
+     func_inc1 = env * cos(omega1*((time-t1_s-pulse_tw1*0.5d0)))
+
+  else if(ae_shape1=="CW_chirp")then  !edge=100fs/chirp_range=1000cm
+
+     t_edge = 100d0 / au_time_fs
+     omg_chirp = 0d0
+     if(time.ge.t1_s .and. time.le.t1_e) then
+        omg_region = 1000d0   ![cm-1]
+        omg_region = omg_region * 1.239842428713634d-4 / 27.2114d0 ![cm-1]->[Hartree]
+        omg_min    = omega1 - 0.5d0 * omg_region
+        omg_chirp  = omg_min + (time - t1_s)/pulse_tw1 * omg_region
+        if(time.ge.t1_s .and. time.le.t1_s + t_edge) then
+           env = sin((time-t1_s)/(2d0*t_edge)*pi)**2
+        else if( time.ge.t1_e - t_edge .and. time.le.t1_e) then
+           env = sin((time-(t1_e-2d0*t_edge))/(2d0*t_edge)*pi)**2
+        else
+           env = 1.0d0
+        endif
+     endif
+     func_inc1 = env * cos(omg_chirp*((time-t1_s-pulse_tw1*0.5d0)))
+
+  else if(ae_shape1=="Acos2_chirp")then  !chirp_range=1000cm
+     omg_region = 1000d0   ![cm-1]
+     omg_region = omg_region * 1.239842428713634d-4 / 27.2114d0 ![cm-1]->[Hartree]
+     omg_min    = omega1 - 0.5d0 * omg_region
+     omg_chirp  = omg_min + (time - t1_s)/pulse_tw1 * omg_region
+     if(time.ge.t1_s .and. time.le.t1_e) env = sin((time-t1_s)/pulse_tw1*pi)**2
+     func_inc1 = env * cos(omg_chirp*((time-t1_s-pulse_tw1*0.5d0)))
+
   else
      stop
   endif
@@ -1996,12 +2184,14 @@ subroutine  init_absorb_bound_1d_PML
   real(8) :: tmp_pi2dt, tmp_coef
 
   if(.not. flag_use_E_B) then
-     allocate( D1_pml( 1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
-     allocate( D2_pml( 1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+     if(.not.allocated(D1_pml)) then
+        allocate( D1_pml( 1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+        allocate( D2_pml( 1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+        D1_pml(:,:,:,:)=0d0
+        D2_pml(:,:,:,:)=0d0
+     endif
      allocate( D1_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
      allocate( D2_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
-     D1_pml(:,:,:,:)=0d0
-     D2_pml(:,:,:,:)=0d0
      a_pml = 1d0  !parameter, now set to 1 according to the paper
   endif
 
@@ -2029,5 +2219,126 @@ subroutine  init_absorb_bound_1d_PML
 ! endif
 
 end subroutine
+
+subroutine calc_energy_joule_subtract_light_source()
+  use Global_variables
+  implicit none
+  integer :: ix, iy, iz
+  real(8) :: elec_mid_old(3), jm_mid_old(3), ohm_mid_old
+
+  iy = ny_origin_m
+  iz = nz_origin_m
+  ix = ix_light_source
+
+  jm_mid_old   = (Jm_ms(:,ix,iy,iz) + Jm_old_ms(:,ix,iy,iz))*0.5d0
+  elec_mid_old = -(Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz))/dt
+  ohm_mid_old  = sum(-jm_mid_old * elec_mid_old)
+  energy_joule_ms(ix,iy,iz) = energy_joule_ms(ix,iy,iz) &
+                              - ohm_mid_old * aLxyz * dt  !subtract
+
+  return
+end subroutine calc_energy_joule_subtract_light_source
+
+subroutine read_write_ms_cmd(iflag_read_write_ms)
+  use salmon_global
+  use salmon_communication
+  use salmon_parallel
+  use global_variables
+  use misc_routines
+  implicit none
+  integer,intent(in) :: iflag_read_write_ms
+  integer :: imacro
+  integer :: nfile_md_ms, nfile_ae_ms, nfile_other_ms
+  integer :: ix_m,iy_m,iz_m
+  character(1024) :: md_file_ms, ae_file_ms, dir_ae_file_ms, other_file_ms
+  real(8),allocatable :: energy_joule_ms_tmp(:,:,:)
+
+  !copy from GS/io_gs_wfn_k.f90
+  character(256) :: rt_wfn_directory
+  integer,parameter :: nfile_md     = 43
+  integer,parameter :: nfile_ae     = 44
+  integer,parameter :: nfile_al     = 45
+  integer,parameter :: iflag_read_rt = 0
+  integer,parameter :: iflag_write_rt= 1
+  !--------------------------------------
+
+  if(.not. allocated(energy_joule_ms_tmp)) &
+     allocate( energy_joule_ms_tmp(nx1_m:nx2_m, ny1_m:ny2_m, nz1_m:nz2_m) )
+  if(.not. allocated(D1_pml)) then
+     allocate( D1_pml(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+     allocate( D2_pml(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+  endif
+
+  if (comm_is_root(nproc_id_global)) then
+     nfile_ae_ms = 7000
+     dir_ae_file_ms = trim(dir_ms)//'rt_ae_field/'
+     if(iflag_read_write_ms==iflag_write_rt) call create_directory(dir_ae_file_ms)
+     ae_file_ms = trim(dir_ae_file_ms)//'ae_field'
+     open(nfile_ae_ms,file=trim(ae_file_ms),form='unformatted')
+     select case(iflag_read_write_ms)
+     case(iflag_write_rt)
+        write(nfile_ae_ms)     Ac_new_ms,    Ac_ms,Jm_new_ms,Jm_ms, D1_pml, D2_pml
+     case(iflag_read_rt )
+        read(nfile_ae_ms ) add_Ac_new_ms,add_Ac_ms,Jm_new_ms,Jm_ms, D1_pml, D2_pml
+     end select
+     close(nfile_ae_ms)
+  end if
+
+  do imacro = nmacro_s, nmacro_e
+
+     write (rt_wfn_directory,'(A,A)') trim(dir_ms_M(imacro)),'/rt_wfn_k/'
+
+     nfile_md_ms     = 7000 + nproc_id_global
+     nfile_other_ms  = nfile_md_ms
+
+     if(comm_is_root(nproc_id_tdks)) then
+        if(iflag_read_write_ms==iflag_write_rt) call create_directory(rt_wfn_directory)
+        md_file_ms = trim(rt_wfn_directory)//'Rion_velocity'
+        open(nfile_md_ms,file=trim(md_file_ms),form='unformatted')
+        select case(iflag_read_write_ms)
+        case(iflag_write_rt); write(nfile_md_ms) Rion,velocity
+        case(iflag_read_rt ); read(nfile_md_ms ) Rion,velocity
+        end select
+        close(nfile_md)
+
+        other_file_ms = trim(rt_wfn_directory)//'others'
+        open(nfile_other_ms,file=trim(other_file_ms),form='unformatted')
+        ix_m = macropoint(1,imacro)
+        iy_m = macropoint(2,imacro)
+        iz_m = macropoint(3,imacro)
+        select case(iflag_read_write_ms)
+        case(iflag_write_rt); write(nfile_other_ms) Eall0_m(imacro), energy_joule_ms(ix_m,iy_m,iz_m)
+        case(iflag_read_rt ); read(nfile_other_ms ) Eall0_m(imacro), energy_joule_ms_tmp(ix_m,iy_m,iz_m)
+        end select
+        close(nfile_other_ms)
+
+     end if
+
+     call comm_sync_all
+
+
+     if(iflag_read_write_ms == iflag_read_rt) then
+
+        call comm_bcast(Rion,    nproc_group_tdks)
+        call comm_bcast(velocity,nproc_group_tdks)
+        Rion_eq(:,:)           = Rion(:,:)
+        Rion_m(:,:,imacro)     = Rion(:,:)
+        Rion_eq_m(:,:,imacro)  = Rion_m(:,:,imacro)
+        velocity_m(:,:,imacro) = velocity(:,:)
+
+        call comm_summation(energy_joule_ms_tmp,energy_joule_ms,&
+                             &(nx2_m-nx1_m+1)*(ny2_m-ny1_m+1)*(nz2_m-nz1_m+1),nproc_group_global)
+        call comm_bcast(add_Ac_ms,     nproc_group_global)
+        call comm_bcast(add_Ac_new_ms, nproc_group_global)
+        call comm_bcast(Jm_new_ms,     nproc_group_global)
+        call comm_bcast(Jm_ms,         nproc_group_global)
+        call comm_bcast(D1_pml,        nproc_group_global)
+        call comm_bcast(D2_pml,        nproc_group_global)
+        
+     endif
+
+  enddo  !imacro
+
+  end subroutine read_write_ms_cmd
 
 end module

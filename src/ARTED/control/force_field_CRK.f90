@@ -129,7 +129,8 @@ contains
 
           !for prevent polarization catastrophy (see ishiyama's paper in 2011)
           r0_bnd_c(is,ib_r) = 0.16d0/au_length_aa ![A]->[au]
-          kbnd_c(is,ib_r)   = 5d2  ! [au]
+          kbnd_c(is,ib_r)   = 0d0  ! [au]  !! now this potential is turned off
+          !kbnd_c(is,ib_r)   = 5d2  ! [au]
           !(following is suggestion from ishiyama-kun)
           !r0_bnd_c(is,ib_r) = 0.15d0/au_length_aa ![A]->[au]
           !kbnd_c(is,ib_r)   = 2d3  ! [au]
@@ -538,7 +539,7 @@ contains
     real(8) :: Qai_old(4,nmol),Q0ai(4,nmol), dQave
     real(8) :: QiQj, dQdr_wat(3,4,3,nmol)
     real(8) :: Kai(4,4,nmol), dKdr_wat(3,4,4,3,nmol) 
-    real(8) :: Vai(4,nmol), tmp_sumKV(3,4)
+    real(8) :: Vai(4,nmol), Vai_old(4,nmol), tmp_sumKV(3,4)
     real(8) :: erf_rij,exp_rij, a_ewald_rij
     real(8) :: tmp_s,tmp_c,tmp_coef,tmp1,tmp2,tmp3
 
@@ -709,6 +710,7 @@ contains
 
        !get charge Qai using Vai
        Qai_old(:,:) = Qai(:,:)
+       Vai_old(:,:) = Vai(:,:)
        dQave = 0d0
        do imol=1,nmol
        do ia_wX= 1,natom_wX_mol(imol)  ! X1,X2,H1,H2
@@ -717,6 +719,17 @@ contains
        enddo
        enddo
        dQave = sqrt( dQave/NI_wX )
+
+       !check convergence
+       if(dQave .le. dQave_thresh) then
+         !write(*,*) "#Qai is converged: dQave=", dQave, iter
+          Qai(:,:) = Qai_old(:,:)   !take back to avoid tiny error when no changes
+         !Vai(:,:) = Vai_old(:,:)
+          exit
+       else if(iter == iter_max) then
+          if (comm_is_root(nproc_id_global)) &
+          write(*,*) "#iter=iter_max: not converged", dQave, iter
+       endif
 
        !get Vai using Qai
        Vai(:,:) = 0d0
@@ -827,15 +840,6 @@ contains
        enddo
        enddo
 !$omp end parallel do
-       endif
-
-       !check convergence
-       if(dQave .le. dQave_thresh) then
-         !write(*,*) "#Qai is converged: dQave=", dQave, iter
-          exit
-       else if(iter == iter_max) then
-          if (comm_is_root(nproc_id_global)) &
-          write(*,*) "#iter=iter_max: not converged", dQave, iter
        endif
 
     enddo  !iter
