@@ -40,7 +40,7 @@ module control_ms_cmd
   real(8) :: R_pml, sgm_max_E_pml, sgm_max_B_pml, a_pml
   character(3) :: ABC_method
   real(8),allocatable :: xi_nh_m(:),Enh_m_t(:,:),Hnvt_m_t(:,:)
-
+  real(8) :: fric
 contains
 
 subroutine init_cmd_maxwell_ms
@@ -54,14 +54,13 @@ subroutine init_cmd_maxwell_ms
   use timer
   use force_field_CRK, only: allocate_ff_CRK,load_force_field_CRK,prepare_force_field_CRK,&
                               iter_max, dQave_thresh, a_ewald, r_cutoff, G_cutoff
-  use inputoutput, only: au_length_aa
+  use inputoutput, only: au_length_aa, au_time_fs
   implicit none
   integer :: is,ispecies, imol,num_mol, ia,j,ik
   integer :: tmp_natom, tmp_mol2species(NI), tmp_mol2atom_top(NI+1)
-  real(8) :: tmpr(3), uconv
+  real(8) :: tmpr(3), uconv, tau_fric
   character(1024) :: ifile_cmd_ms
   character(100)  :: char_atom, ctmp1
-
   
   !keyword check
   if(use_ms_maxwell=='n') then
@@ -70,7 +69,7 @@ subroutine init_cmd_maxwell_ms
   endif
 
 !  flag_use_E_B = .true.  !test hoge
-  flag_use_E_B = .false.  !test hoge
+  flag_use_E_B = .false.
   if(flag_use_E_B) then
      if(comm_is_root(nproc_id_global)) write(*,*) "flag_use_E_B= ", flag_use_E_B
      allocate( E_ms(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
@@ -217,11 +216,24 @@ subroutine init_cmd_maxwell_ms
 
   !(read input no.5 & close the file)
   if (comm_is_root(nproc_id_global)) then
+     read(800,*) tau_fric
 !     read(800,*) flag_advanced  !=.false.
 !     if(flag_advanced)then
 !        read(800,*) keywd
 !     endif
      close(800)
+  endif
+
+  call comm_bcast(tau_fric, nproc_group_global)
+
+  !(temperature effect)
+  tau_fric = tau_fric / au_time_fs  ![au] relax time constant
+  if(tau_fric.le.1d-10) then
+     fric = 0d0
+     if(comm_is_root(nproc_id_global)) write(*,*) "#friction is not applied"
+  else
+     fric = 1d0/tau_fric
+     if(comm_is_root(nproc_id_global)) write(*,*) "#friction is applied: fric=",real(fric)
   endif
 
   !(log)
@@ -307,8 +319,7 @@ subroutine cmd_maxwell_ms
   implicit none
   integer :: iter, ix_m, iy_m, iz_m, imacro,igroup,i, index
   logical :: flg_out_ms_step, flg_out_ms_next_step
-  real(8) :: aforce(3,NI),Temperature_ion
-  real(8) :: gkT, Qnh
+  real(8) :: Temperature_ion, gkT, Qnh
   real(8),allocatable :: Enh_m(:), Enh_gkTlns_m(:)
   real(8),allocatable :: Mt_ms(:,:)
   character(100) :: comment_line
@@ -508,12 +519,11 @@ subroutine cmd_maxwell_ms
       call dt_evolve_MD_1_MS(iter,imacro)
 
       ! force
-      aforce(:,:) = force_m(:,:,imacro)
       call cal_force_energy_CRK_MS(imacro)
 
       !! update coordinate and velocity in MD option (part-2)
       if(.not.flag_fix_atoms_md) &
-      call dt_evolve_MD_2_MS(aforce,iter,imacro)
+      call dt_evolve_MD_2_MS(iter,imacro)
 
       ! current
       call cal_dipole_moment_current_ms(Mt_ms(:,imacro),jav,dt,imacro)
@@ -1362,7 +1372,9 @@ contains
     !update velocity with dt/2
     do ia=1,NI
        mass_au = umass*Mass(Kion(ia))
-       velocity(:,ia) = velocity(:,ia) + force(:,ia)/mass_au * dt_h
+      !velocity(:,ia) = velocity(:,ia) + force(:,ia)/mass_au * dt_h
+       velocity(:,ia) = velocity(:,ia) + force(:,ia)/mass_au * dt_h  &
+       &                               - fric * velocity(:,ia) * dt_h
     enddo
 
     !velocity scaling
@@ -1392,23 +1404,23 @@ contains
    
   end subroutine
 
-  subroutine dt_evolve_MD_2_MS(aforce,it,imacro)
+  subroutine dt_evolve_MD_2_MS(it,imacro)
     use md_ground_state
     implicit none
     integer :: it,imacro, ia
-    real(8) :: dt_h,Ework,aforce(3,NI),Temperature_ion, mass_au
+    real(8) :: dt_h,Ework, Temperature_ion, mass_au
 
     dt_h = dt/2d0
     velocity(:,:) = velocity_m(:,:,imacro)
     force(:,:)    = force_m(:,:,imacro)
 
-    aforce(:,:) = 0.5d0*( aforce(:,:) + force(:,:) )
-
     !update ion velocity with dt/2
     Ework = 0d0
     do ia=1,NI
        mass_au = umass*Mass(Kion(ia))
-       velocity(:,ia) = velocity(:,ia) + force(:,ia)/mass_au * dt_h
+      !velocity(:,ia) = velocity(:,ia) + force(:,ia)/mass_au * dt_h
+       velocity(:,ia) = velocity(:,ia) + force(:,ia)/mass_au * dt_h  &
+       &                               - fric * velocity(:,ia) * dt_h
     enddo
 
     !NHC act on velocity with dt/2
@@ -1428,8 +1440,8 @@ contains
     data_local_MD(3,imacro,it) = Eall_ms(imacro)  !=Uene+Tene
 
     if(ensemble=="NVT".and.thermostat=="nose-hoover")then
-       Enh_m_t(imacro,it)  = Enh_m(imacro)
-       Hnvt_m_t(imacro,it) = Enh_m(imacro) + Eall_ms(imacro)
+       Enh_m_t(it,imacro)  = Enh_m(imacro)
+       Hnvt_m_t(it,imacro) = Enh_m(imacro) + Eall_ms(imacro)
     endif
 
     velocity_m(:,:,imacro) = velocity(:,:)
@@ -2120,105 +2132,131 @@ end subroutine dt_evolve_EB_1d_cmd
 !===========================================================
 subroutine apply_light_source_1d_J
   use Global_variables
-  use inputoutput, only: au_time_fs
   implicit none
   integer :: iy,iz
-  real(8) :: E0inc_abs, E0inc(3)
-  real(8) :: time,t1_s,t1_e, env,func_inc1, t_edge
-  real(8) :: omg_chirp, omg_min, omg_region
+  real(8) :: time, func_inc, E0inc(3), Jm_add(3), t2_delay
 
   iy = ny_origin_m
   iz = nz_origin_m
-
-  E0inc_abs = 5.338d-9*sqrt(rlaser_int_wcm2_1)   ! electric field in a.u.
-  E0inc(:)  = E0inc_abs * epdir_re1(:)
-
   time = (iter_save-1)*dt
 
-  t1_s = t1_delay
-  t1_e = t1_delay + pulse_tw1
+
+  call add_light_source_1d_J(rlaser_int_wcm2_1, epdir_re1, ae_shape1, t1_delay, &
+                             pulse_tw1, omega1, time, E0inc, func_inc)
+  Jm_add(:) = c_light/(2d0*pi*HX_m) * E0inc(:) * func_inc
+  Jm_ms(:,ix_light_source,iy,iz) = Jm_add(:)
+
+  t2_delay = t1_delay + t1_t2
+  call add_light_source_1d_J(rlaser_int_wcm2_2, epdir_re2, ae_shape2, t2_delay, &
+                             pulse_tw2, omega2, time, E0inc, func_inc)
+  Jm_add(:) = c_light/(2d0*pi*HX_m) * E0inc(:) * func_inc
+  Jm_ms(:,ix_light_source,iy,iz) = Jm_ms(:,ix_light_source,iy,iz) + Jm_add(:)
+
+end subroutine apply_light_source_1d_J
+
+
+subroutine  add_light_source_1d_J(rlaser_int_wcm2, epdir_re, ae_shape, t_delay, &
+                                  pulse_tw, omega, time, E0inc, func_inc)
+  use inputoutput, only: au_time_fs
+  implicit none
+  real(8) :: rlaser_int_wcm2, epdir_re(3), t_delay, pulse_tw, omega
+  real(8) :: E0inc_abs, E0inc(3)
+  real(8) :: time,t_s,t_e, env, func_inc, t_edge
+  real(8) :: omg_chirp, omg_min, omg_region
+  character(*) :: ae_shape
+
+  if(rlaser_int_wcm2.le.0d0) then
+     E0inc(:)  = 0d0
+  else
+     E0inc_abs = 5.338d-9*sqrt(rlaser_int_wcm2)   ! electric field in a.u.
+     E0inc(:)  = E0inc_abs * epdir_re(:)
+  endif
+
+  t_s = t_delay
+  t_e = t_delay + pulse_tw
   env = 0d0
 
-  if(ae_shape1=="Acos2")then
+  if(ae_shape=="Acos2")then
 
-     if(time.ge.t1_s .and. time.le.t1_e) env = sin((time-t1_s)/pulse_tw1*pi)**2
-     func_inc1 = env * cos(omega1*((time-t1_s-pulse_tw1*0.5d0)))
+     if(time.ge.t_s .and. time.le.t_e) env = sin((time-t_s)/pulse_tw*pi)**2
+     func_inc = env * cos(omega*((time-t_s-pulse_tw*0.5d0)))
 
-  else if(ae_shape1=="Acos4")then
+  else if(ae_shape=="Acos4")then
 
-     if(time.ge.t1_s .and. time.le.t1_e) env = sin((time-t1_s)/pulse_tw1*pi)**4
-     func_inc1 = env * cos(omega1*((time-t1_s-pulse_tw1*0.5d0)))
+     if(time.ge.t_s .and. time.le.t_e) env = sin((time-t_s)/pulse_tw*pi)**4
+     func_inc = env * cos(omega*((time-t_s-pulse_tw*0.5d0)))
 
-  else if(ae_shape1=="CW_edge20fs")then
+  else if(ae_shape=="CW_edge20fs")then
 
      t_edge = 20d0 / au_time_fs
-     if(time.ge.t1_s .and. time.le.t1_e) then
-        if(time.ge.t1_s .and. time.le.t1_s + t_edge) then
-           env = sin((time-t1_s)/(2d0*t_edge)*pi)**2
-        else if( time.ge.t1_e - t_edge .and. time.le.t1_e) then
-           env = sin((time-(t1_e-2d0*t_edge))/(2d0*t_edge)*pi)**2
+     if(time.ge.t_s .and. time.le.t_e) then
+        if(time.ge.t_s .and. time.le.t_s + t_edge) then
+           env = sin((time-t_s)/(2d0*t_edge)*pi)**2
+        else if( time.ge.t_e - t_edge .and. time.le.t_e) then
+           env = sin((time-(t_e-2d0*t_edge))/(2d0*t_edge)*pi)**2
         else
            env = 1.0d0
         endif
      endif
-     func_inc1 = env * cos(omega1*((time-t1_s-pulse_tw1*0.5d0)))
+     func_inc = env * cos(omega*((time-t_s-pulse_tw*0.5d0)))
 
-  else if(ae_shape1=="CW_edge100fs")then
+  else if(ae_shape=="CW_edge100fs")then
 
      t_edge = 100d0 / au_time_fs
-     if(time.ge.t1_s .and. time.le.t1_e) then
-        if(time.ge.t1_s .and. time.le.t1_s + t_edge) then
-           env = sin((time-t1_s)/(2d0*t_edge)*pi)**2
-        else if( time.ge.t1_e - t_edge .and. time.le.t1_e) then
-           env = sin((time-(t1_e-2d0*t_edge))/(2d0*t_edge)*pi)**2
+     if(time.ge.t_s .and. time.le.t_e) then
+        if(time.ge.t_s .and. time.le.t_s + t_edge) then
+           env = sin((time-t_s)/(2d0*t_edge)*pi)**2
+        else if( time.ge.t_e - t_edge .and. time.le.t_e) then
+           env = sin((time-(t_e-2d0*t_edge))/(2d0*t_edge)*pi)**2
         else
            env = 1.0d0
         endif
      endif
-     func_inc1 = env * cos(omega1*((time-t1_s-pulse_tw1*0.5d0)))
+     func_inc = env * cos(omega*((time-t_s-pulse_tw*0.5d0)))
 
-  else if(ae_shape1=="CW_chirp")then  !edge=100fs/chirp_range=1000cm
+  else if(ae_shape=="CW_chirp")then  !edge=100fs/chirp_range=1000cm
 
      t_edge = 100d0 / au_time_fs
      omg_chirp = 0d0
-     if(time.ge.t1_s .and. time.le.t1_e) then
+     if(time.ge.t_s .and. time.le.t_e) then
         omg_region = 1000d0   ![cm-1]
         omg_region = omg_region * 1.239842428713634d-4 / 27.2114d0 ![cm-1]->[Hartree]
-        omg_min    = omega1 - 0.5d0 * omg_region
-        omg_chirp  = omg_min + (time - t1_s)/pulse_tw1 * omg_region
-        if(time.ge.t1_s .and. time.le.t1_s + t_edge) then
-           env = sin((time-t1_s)/(2d0*t_edge)*pi)**2
-        else if( time.ge.t1_e - t_edge .and. time.le.t1_e) then
-           env = sin((time-(t1_e-2d0*t_edge))/(2d0*t_edge)*pi)**2
+        omg_min    = omega - 0.5d0 * omg_region
+        omg_chirp  = omg_min + (time - t_s)/pulse_tw * omg_region
+        if(time.ge.t_s .and. time.le.t_s + t_edge) then
+           env = sin((time-t_s)/(2d0*t_edge)*pi)**2
+        else if( time.ge.t_e - t_edge .and. time.le.t_e) then
+           env = sin((time-(t_e-2d0*t_edge))/(2d0*t_edge)*pi)**2
         else
            env = 1.0d0
         endif
      endif
-     func_inc1 = env * cos(omg_chirp*((time-t1_s-pulse_tw1*0.5d0)))
+     func_inc = env * cos(omg_chirp*((time-t_s-pulse_tw*0.5d0)))
 
-  else if(ae_shape1=="Acos2_chirp")then  !chirp_range=1000cm
+  else if(ae_shape=="Acos2_chirp")then  !chirp_range=1000cm
      omg_region = 1000d0   ![cm-1]
      omg_region = omg_region * 1.239842428713634d-4 / 27.2114d0 ![cm-1]->[Hartree]
-     omg_min    = omega1 - 0.5d0 * omg_region
-     omg_chirp  = omg_min + (time - t1_s)/pulse_tw1 * omg_region
-     if(time.ge.t1_s .and. time.le.t1_e) env = sin((time-t1_s)/pulse_tw1*pi)**2
-     func_inc1 = env * cos(omg_chirp*((time-t1_s-pulse_tw1*0.5d0)))
+     omg_min    = omega - 0.5d0 * omg_region
+     omg_chirp  = omg_min + (time - t_s)/pulse_tw * omg_region
+     if(time.ge.t_s .and. time.le.t_e) env = sin((time-t_s)/pulse_tw*pi)**2
+     func_inc = env * cos(omg_chirp*((time-t_s-pulse_tw*0.5d0)))
 
-  else if(ae_shape1=="Acos2_chirpB")then  !chirp_range=2000cm
+  else if(ae_shape=="Acos2_chirpB")then  !chirp_range=2000cm
      omg_region = 2000d0   ![cm-1]
      omg_region = omg_region * 1.239842428713634d-4 / 27.2114d0 ![cm-1]->[Hartree]
-     omg_min    = omega1 - 0.5d0 * omg_region
-     omg_chirp  = omg_min + (time - t1_s)/pulse_tw1 * omg_region
-     if(time.ge.t1_s .and. time.le.t1_e) env = sin((time-t1_s)/pulse_tw1*pi)**2
-     func_inc1 = env * cos(omg_chirp*((time-t1_s-pulse_tw1*0.5d0)))
+     omg_min    = omega - 0.5d0 * omg_region
+     omg_chirp  = omg_min + (time - t_s)/pulse_tw * omg_region
+     if(time.ge.t_s .and. time.le.t_e) env = sin((time-t_s)/pulse_tw*pi)**2
+     func_inc = env * cos(omg_chirp*((time-t_s-pulse_tw*0.5d0)))
 
+  else if(ae_shape=="none")then
+     func_inc = 0d0
   else
-     stop
+     func_inc = 0d0
+     if(comm_is_root(nproc_id_global)) write(*,*) "#No such name of ae_shape:", trim(ae_shape)
   endif
 
-  Jm_ms(:,ix_light_source,iy,iz) = c_light/(2d0*pi*HX_m) * E0inc(:) * func_inc1
-
-end subroutine apply_light_source_1d_J
+end subroutine
 
 subroutine  init_absorb_bound_1d_PML
   implicit none
@@ -2269,7 +2307,8 @@ subroutine apply_nose_hoover_velocity_ms(imacro,dt_h)
   
   tmp_exp = exp(-xi_nh_m(imacro)*dt_h)
   do ia=1,NI
-     velocity_m(:,ia,imacro) = velocity_m(:,ia,imacro) * tmp_exp
+!     velocity_m(:,ia,imacro) = velocity_m(:,ia,imacro) * tmp_exp
+     velocity(:,ia) = velocity(:,ia) * tmp_exp
   enddo
   
   return
