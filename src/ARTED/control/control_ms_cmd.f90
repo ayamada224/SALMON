@@ -24,23 +24,31 @@ module control_ms_cmd
   implicit none
   logical :: flag_ms_ff_LessPrint,  flag_fix_atoms_md 
   logical :: flag_use_absorb_bound, flag_use_light_source
-  logical :: flag_use_E_B
-  integer :: iter_save, ix_light_source
+  logical :: flag_method_newton_Et
+  logical,allocatable :: flag_conv_iter2(:)
+  integer :: iter_save, iter2, ix_light_source
   integer :: M_pml,nx_pml, nx1_pml,nx2_pml
-  real(8),allocatable :: Rion_eq0(:,:) 
-  real(8),allocatable :: Qai_ms(:,:,:), Qai_old_ms(:,:,:), Rxyz_wX_ms(:,:,:,:)
+  real(8),allocatable :: Rion_eq0(:,:), Rxyz_wX_ms(:,:,:,:)
+  real(8),allocatable :: Qai_ms(:,:,:), Qai_old_ms(:,:,:)
+  real(8),allocatable :: Qai_bk_ms(:,:,:)
   real(8),allocatable :: Uene_ms(:), Tene_ms(:), Eall_ms(:)
+  real(8),allocatable :: Uene_intra_ms(:), force_intra_m(:,:,:)
   real(8),allocatable :: E_ms(:,:,:,:), B_ms(:,:,:,:)
-  real(8),allocatable :: E_m(:,:), B_m(:,:)
+  real(8),allocatable :: E_m(:,:), B_m(:,:), E_m_iter(:,:), E_m_bk(:,:)
   real(8),allocatable :: E_last(:,:,:,:), B_last(:,:,:,:)
-  real(8),allocatable :: E_last_m(:,:)
+  real(8),allocatable :: E_hist_m(:,:,:)
   real(8),allocatable :: D1_pml(:,:,:,:), D2_pml(:,:,:,:)
   real(8),allocatable :: D1_last(:,:,:,:),D2_last(:,:,:,:)
+  real(8),allocatable :: velocity_m_mid(:,:,:),Rion_m_mid(:,:,:)
+  real(8),allocatable :: Rxyz_wX_ms_mid(:,:,:,:), Rxyz_wX_ms_bk(:,:,:,:)
   real(8),allocatable :: data_local_MD(:,:,:)
   real(8) :: R_pml, sgm_max_E_pml, sgm_max_B_pml, a_pml
   character(3) :: ABC_method
   real(8),allocatable :: xi_nh_m(:),Enh_m_t(:,:),Hnvt_m_t(:,:)
-  real(8) :: fric
+  real(8) :: fric, conv_iter2, dEt_pc
+  integer :: npt_intpl_E
+  real(8),allocatable :: vpr(:,:,:), vmr(:,:,:), rvec(:,:,:), Qvec_bk(:,:)
+  real(8),allocatable :: vec2_tmp_m(:,:),vec3_tmp_m(:,:)
 contains
 
 subroutine init_cmd_maxwell_ms
@@ -53,7 +61,7 @@ subroutine init_cmd_maxwell_ms
   use misc_routines
   use timer
   use force_field_CRK, only: allocate_ff_CRK,load_force_field_CRK,prepare_force_field_CRK,&
-                              iter_max, dQave_thresh, a_ewald, r_cutoff, G_cutoff
+                              iter_max, a_ewald, r_cutoff, G_cutoff, NI_wX  !, dQave_thresh
   use inputoutput, only: au_length_aa, au_time_fs
   implicit none
   integer :: is,ispecies, imol,num_mol, ia,j,ik
@@ -68,18 +76,27 @@ subroutine init_cmd_maxwell_ms
      stop
   endif
 
-!  flag_use_E_B = .true.  !test hoge
-  flag_use_E_B = .false.
-  if(flag_use_E_B) then
-     if(comm_is_root(nproc_id_global)) write(*,*) "flag_use_E_B= ", flag_use_E_B
-     allocate( E_ms(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
-     allocate( B_ms(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
-     allocate( E_m(1:3,1:nmacro) )
-     allocate( B_m(1:3,1:nmacro) )
-     allocate( E_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
-     allocate( B_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
-     allocate( E_last_m(1:3,1:nmacro) )
+  flag_method_newton_Et = .true.  !must be .true.
+
+  npt_intpl_E = 4     !number of interpolation for E(t) to predictor
+ !(read from input now)
+ !conv_iter2  = 1d-10 !convergence of E(t) for pred-corrector [au]
+  if(comm_is_root(nproc_id_global)) then
+     write(*,*) "number of interpolation points for E(t) prediction=", npt_intpl_E
+     write(*,*) "convergence for predictor-corrector of E(t) [au]=", conv_iter2
   endif
+  allocate( E_ms(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+  allocate( B_ms(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+  allocate( E_m(1:3,1:nmacro) )
+  allocate( B_m(1:3,1:nmacro) )
+  allocate( E_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+  allocate( B_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
+  allocate( E_hist_m(1:3,1:nmacro,npt_intpl_E-1) )
+  allocate( E_m_bk(1:3,1:nmacro), E_m_iter(1:3,1:nmacro) )
+  allocate( flag_conv_iter2(1:nmacro) )
+  E_hist_m(:,:,:)=0d0
+  allocate( velocity_m_mid(3,NI,nmacro_s:nmacro_e) )
+  allocate( Rion_m_mid(3,NI,nmacro_s:nmacro_e) )
 
   allocate( data_local_MD(3,nmacro_s:nmacro_e,0:Nt) )
 
@@ -199,7 +216,8 @@ subroutine init_cmd_maxwell_ms
   !(read input no.4)
   if (comm_is_root(nproc_id_global)) then
      read(800,*) iter_max       !=50 is enough
-     read(800,*) dQave_thresh   !=1d-7 [au]  (from paper)
+    !read(800,*) dQave_thresh   !=1d-7 [au]  (from paper)
+     read(800,*) conv_iter2     !=1d-10 [au] convergence of E(t) for pred-corrector
      read(800,*) a_ewald        != [1/A]
      read(800,*) r_cutoff       !=13.0 [A]   (from paper)
      read(800,*) G_cutoff       !=1.47 [1/A] (from paper)
@@ -209,7 +227,8 @@ subroutine init_cmd_maxwell_ms
   endif
 
   call comm_bcast(iter_max,     nproc_group_global)
-  call comm_bcast(dQave_thresh, nproc_group_global)
+ !call comm_bcast(dQave_thresh, nproc_group_global)
+  call comm_bcast(conv_iter2,   nproc_group_global)
   call comm_bcast(a_ewald,      nproc_group_global)
   call comm_bcast(r_cutoff,     nproc_group_global)
   call comm_bcast(G_cutoff,     nproc_group_global)
@@ -264,10 +283,23 @@ subroutine init_cmd_maxwell_ms
   !allocation for multi-scale
   allocate( Qai_ms(4,nmol,nmacro_s:nmacro_e) )
   allocate( Qai_old_ms(4,nmol,nmacro_s:nmacro_e) )
+  allocate( Qai_bk_ms(4,nmol,nmacro_s:nmacro_e) )
   allocate( Rxyz_wX_ms(3,4,nmol,nmacro_s:nmacro_e) )
+  allocate( Rxyz_wX_ms_mid(3,4,nmol,nmacro_s:nmacro_e) )
+  allocate( Rxyz_wX_ms_bk( 3,4,nmol,nmacro_s:nmacro_e) )
   allocate( Uene_ms(nmacro_s:nmacro_e) )
   allocate( Tene_ms(nmacro_s:nmacro_e) )
   allocate( Eall_ms(nmacro_s:nmacro_e) )
+  allocate( Uene_intra_ms(nmacro_s:nmacro_e) )
+  allocate( force_intra_m(3,NI,nmacro_s:nmacro_e) )
+  if(flag_method_newton_Et) then
+     allocate( vpr( 3,NI_wX,nmacro_s:nmacro_e), vmr(3,NI_wX,nmacro_s:nmacro_e) )
+     allocate( rvec(3,NI_wX,nmacro_s:nmacro_e) )
+     allocate( Qvec_bk(NI_wX,nmacro_s:nmacro_e) )
+     allocate( vec2_tmp_m(NI_wX,nmacro_s:nmacro_e) )
+     allocate( vec3_tmp_m(NI_wX,nmacro_s:nmacro_e) )
+  endif
+
 
   !read coordinate of equiblium position (necessary?? maybe not)
   allocate( Rion_eq0(3,NI) )
@@ -314,15 +346,17 @@ subroutine cmd_maxwell_ms
   use salmon_communication
   use salmon_file
   use misc_routines
-  use inputoutput, only: t_unit_time, t_unit_current, t_unit_ac, t_unit_elec
-
+  use inputoutput, only: t_unit_time, t_unit_current, t_unit_elec
   implicit none
+  logical :: flag_iter2_loop
   integer :: iter, ix_m, iy_m, iz_m, imacro,igroup,i, index
   logical :: flg_out_ms_step, flg_out_ms_next_step
   real(8) :: Temperature_ion, gkT, Qnh
   real(8),allocatable :: Enh_m(:), Enh_gkTlns_m(:)
   real(8),allocatable :: Mt_ms(:,:)
   character(100) :: comment_line
+
+  iter2=1
 
 #ifdef ARTED_LBLK
   call opt_vars_init_t4ppt()
@@ -337,12 +371,19 @@ subroutine cmd_maxwell_ms
   allocate( Enh_m(nmacro_s:nmacro_e) )
   allocate( Enh_gkTlns_m(nmacro_s:nmacro_e) )
 
+  !if material region does not exist, nmacro-->0, nmacro_e-->0
+  if(nx_m .le. 0)then
+     nmacro   = 0
+     nmacro_e = 0
+     if(comm_is_root(nproc_id_global)) then
+        write(*,*)"# no material region: set nmacro-->0, nmacro_e-->0"
+     endif
+  endif
+
   do imacro = nmacro_s, nmacro_e
      call take_back_mol_into_ucell_ms(imacro)
   enddo
 
-
-  !Rion_update_rt = rion_update_on
 
   if(comm_is_root(nproc_id_global)) then
      write(*,*) 'This is the end of preparation for Real time calculation'
@@ -354,8 +395,6 @@ subroutine cmd_maxwell_ms
 
   if(flag_use_light_source) then
      if(comm_is_root(nproc_id_global)) write(*,*) "use light source"
-  else
-     call init_Ac_ms
   endif
 
   if(flag_use_absorb_bound .and. ABC_method=="PML") &
@@ -366,7 +405,7 @@ subroutine cmd_maxwell_ms
   !(for restarting with read_rt_wfn_k_ms=y option)
   if(read_rt_wfn_k_ms=='y') then
      call add_init_Ac_ms
-     call assign_mp_variables_omp()
+     call assign_mp_variables_omp_EB()
      do imacro = 1, nmacro
         ix_m = macropoint(1,imacro)
         iy_m = macropoint(2,imacro)
@@ -415,7 +454,7 @@ subroutine cmd_maxwell_ms
   if(read_rt_wfn_k_ms=='n') then
      do imacro = nmacro_s, nmacro_e
         Mt_ms(:,imacro) =0d0  !for initial step
-        call cal_dipole_moment_current_ms(Mt_ms(:,imacro),jav,dt,imacro)
+        call cal_dipole_moment_ms(Mt_ms(:,imacro),dt,imacro)
         jav(:) = 0d0  !for initial step
         if (comm_is_root(nproc_id_tdks)) then
            jm_new_m_tmp(1:3,imacro) = jav(1:3)
@@ -444,89 +483,46 @@ subroutine cmd_maxwell_ms
     flg_out_ms_step = .false.
     if (mod(iter, out_ms_step)==0) flg_out_ms_step=.true.
 
-
-    !! Update of the Macroscopic System
-    
-    !! NOTE: Update the macroscopic variables:
-    !!       Ac_old_ms = Ac_ms; Ac_ms = Ac_new_ms; Ac_new_ms = 0
-    !!       Jm_old_ms = Jm_ms; Jm_ms = Jm_new_ms; Jm_new_ms = 0
-    !!       Energy_Elec_ms = map(Energy_Elec_Matter_new_m); Jm_m = Jm_new_m;
-    call proceed_ms_variables_omp()
-
-
-    !! Calculate "iter+1" macroscopic field (Ac_new_ms, Jm_new_ms)
     iter_save=iter
-    if(flag_use_E_B) then
-       call dt_evolve_EB_1d_cmd() 
-    else
-       if(flag_use_absorb_bound .and. ABC_method=="PML") then
-          call dt_evolve_Ac_1d_cmd_PML()
-       else
-          call dt_evolve_Ac_1d_cmd() 
-       endif
-    endif
-
-
-    !! Compute EM field, energy and other important quantities...
-    call calc_energy_joule()
-    if(flag_use_light_source) &
-    call calc_energy_joule_subtract_light_source() !subtract J of light source 
-    if (flg_out_ms_step) then !! mod(iter, out_ms_step) == 0
-      call calc_elec_field()
-      call calc_bmag_field()
-      call calc_energy_elemag()
-      call calc_total_energy
-    end if
-
-
-    !! NOTE: Mapping between the macropoint and the gridsystem
-    !!       Ac_m <- Ac_ms; Ac_new_m <- Ac_new_ms
-    !!       data_local_Ac_m = Ac_m; data_local_Jm_m = Jm_m
-    call assign_mp_variables_omp()
-    !! Store data_vac_ac variables
-    call store_data_local_ac_jm()
-    call store_data_vac_ac()
-    !! Store data_out variables
-    if (flg_out_ms_step) then !! mod(iter, out_ms_step) == 0
-       index = iter / out_ms_step
-       if(.not. flag_ms_ff_LessPrint) then !AY
-          call store_data_out_omp(index)
-          call write_data_out(index) !now moved to here
-       endif
-    end if
-
-
-    if (flg_out_ms_step .and. comm_is_root(nproc_id_global)) then
-       if(flag_use_E_B) then
-          write(*,'(1X,A,I6,A,I6)') 'Multiscale iter =', iter, '/', Nt
-       else
-          call trace_ms_calculation()
-       endif
-    end if
-
 
     !! Update of the Microscopic System
-    
-    !! NOTE: flg_out_ms_step (the macroscopic field will exported in next step)
     flg_out_ms_next_step=.false.
     if( mod(iter+1, out_ms_step)==0 ) flg_out_ms_next_step=.true.
 
+    iter2=1
+    flag_conv_iter2(:)=.false.
+
+10  continue
 
     Macro_loop : do imacro = nmacro_s, nmacro_e
       
-      !! update coordinate and velocity in MD option (part-1)
-      if(.not.flag_fix_atoms_md) &
-      call dt_evolve_MD_1_MS(iter,imacro)
+      if(iter2==1) then
+         !! update coordinate and velocity in MD option (part-1)
+         Rion_m_mid(:,:,imacro) = Rion_m(:,:,imacro)
+         if(.not.flag_fix_atoms_md) &
+         call dt_evolve_MD_1_MS(iter,imacro)
+         velocity_m_mid(:,:,imacro) = velocity_m(:,:,imacro)
+         Rion_m_mid(:,:,imacro)= 0.5d0*(Rion_m_mid(:,:,imacro) + Rion_m(:,:,imacro))
+      else
+         velocity_m(:,:,imacro)=velocity_m_mid(:,:,imacro)
+      endif !iter2
 
       ! force
+      if(iter2==1) then
+         Rxyz_wX_ms_bk(:,:,:,imacro) = Rxyz_wX_ms(:,:,:,imacro) 
+         Qai_bk_ms(:,:,imacro) = Qai_ms(:,:,imacro)
+      endif
       call cal_force_energy_CRK_MS(imacro)
+      Rxyz_wX_ms_mid(:,:,:,imacro) = 0.5d0*(Rxyz_wX_ms_bk(:,:,:,imacro)+Rxyz_wX_ms(:,:,:,imacro))
 
       !! update coordinate and velocity in MD option (part-2)
       if(.not.flag_fix_atoms_md) &
       call dt_evolve_MD_2_MS(iter,imacro)
 
       ! current
-      call cal_dipole_moment_current_ms(Mt_ms(:,imacro),jav,dt,imacro)
+      call cal_dipole_moment_current_ms_EB(Mt_ms(:,imacro),jav,dt,imacro)
+
+      if(flag_method_newton_Et) call save_matrix_for_newton_method(imacro)
 
       if(Sym/=1) jav(1:2)=0d0
       !! Special rule for debug mode (macroscopic system does not have a matter)
@@ -536,7 +532,7 @@ subroutine cmd_maxwell_ms
 
       jav(1)=0d0  !force to zero for propagation direction
       if (comm_is_root(nproc_id_tdks)) then
-        jm_new_m_tmp(1:3,imacro) = jav(1:3)
+         jm_new_m_tmp(1:3,imacro) = jav(1:3)
       end if
 
       ! Calculate + store electron energy
@@ -552,25 +548,69 @@ subroutine cmd_maxwell_ms
 
     call comm_summation(jm_new_m_tmp, Jm_new_m, 3 * nmacro, nproc_group_global)
 
-    if (flg_out_ms_next_step) then
-      call comm_summation(energy_elec_Matter_new_m_tmp, energy_elec_Matter_new_m, nmacro, nproc_group_global)
+    if(flg_out_ms_next_step) then
+       call comm_summation(energy_elec_Matter_new_m_tmp, energy_elec_Matter_new_m, nmacro, nproc_group_global)
     end if
-
     
-!$omp parallel do default(shared) private(imacro, ix_m, iy_m, iz_m)
+!$omp parallel do default(shared) private(imacro,ix_m,iy_m,iz_m)
     do imacro = 1, nmacro
-      !! NOTE: If the array "macropoint" is appropriately setted,
-      !!       every set of (ix_m, iy_m, iz_m) would be independent. Therefore,
-      !!       the OpenMP directives of 'reduction' is not required as above.
-      ix_m = macropoint(1, imacro)
-      iy_m = macropoint(2, imacro)
-      iz_m = macropoint(3, imacro)
-      !! Map the local macropoint current into the jm field
-      !Jm_new_ms(1:3, ix_m, iy_m, iz_m) = Jm_new_ms(1:3, ix_m, iy_m, iz_m) & 
-      !                               & + Jm_new_m(1:3, imacro)
+      ix_m = macropoint(1,imacro)
+      iy_m = macropoint(2,imacro)
+      iz_m = macropoint(3,imacro)
       Jm_new_ms(1:3,ix_m,iy_m,iz_m) = matmul(trans_inv(1:3,1:3), Jm_new_m(1:3,imacro))
     end do
 !$omp end parallel do
+
+
+    call proceed_ms_variables_omp_EB(iter2)
+    call dt_evolve_EB_1d_cmd() 
+    call assign_mp_variables_omp_EB()
+
+    iter2=iter2+1
+    if(iter2==100) then
+       write(*,*) "iteration of predictor-corrector did not converge",iter2
+       stop
+    endif
+
+    flag_iter2_loop = .false.
+    do imacro=1,nmacro
+       dEt_pc = sqrt(sum((E_m_bk(:,imacro) - E_m(:,imacro))**2))
+       if( dEt_pc .lt. conv_iter2) then
+          flag_conv_iter2(imacro)=.true.  !not used now
+       else
+          flag_conv_iter2(imacro)=.false.
+          flag_iter2_loop=.true.
+       endif
+    enddo
+
+    call comm_sync_all
+    if(flag_iter2_loop) goto 10
+
+    !! Compute EM field energy and other important quantities
+    call calc_energy_joule_EB()
+    if(flag_use_light_source) &
+    call calc_energy_joule_subtract_light_source_EB() !subtract light source J
+    if (flg_out_ms_step) then !! mod(iter, out_ms_step) == 0
+       call calc_energy_elemag_EB()
+       call calc_total_energy_EB
+    end if
+
+    !! Store data_vac_ac variables
+    call store_data_local_ac_jm()
+    call store_data_vac_ac()
+    !! Store data_out variables
+    if (flg_out_ms_step) then !! mod(iter, out_ms_step) == 0
+       index = iter / out_ms_step
+       if(.not. flag_ms_ff_LessPrint) then !AY
+          call store_data_out_omp(index)
+          call write_data_out(index) !now moved to here
+       endif
+    end if
+
+    !! Print log (energy)
+    if(flg_out_ms_step .and. comm_is_root(nproc_id_global)) then
+       call trace_ms_calculation()
+    end if
 
 
     !===========================================================================
@@ -673,35 +713,46 @@ contains
     end do
   end subroutine
   
-  
-  subroutine proceed_ms_variables_omp()
+  subroutine proceed_ms_variables_omp_EB(iflag)
     implicit none
-    integer :: iimacro, iix_m, iiy_m, iiz_m
+    integer :: iflag, iimacro, iix_m, iiy_m, iiz_m, ipt
 
-    if(.not.flag_use_E_B) then
-!$omp parallel do collapse(3) default(shared) private(iix_m, iiy_m, iiz_m)
-       do iiz_m = mz1_m, mz2_m
-       do iiy_m = my1_m, my2_m
-       do iix_m = mx1_m, mx2_m
-          Ac_old_ms(1:3, iix_m, iiy_m, iiz_m) = Ac_ms    (1:3, iix_m, iiy_m, iiz_m)
-          Ac_ms    (1:3, iix_m, iiy_m, iiz_m) = Ac_new_ms(1:3, iix_m, iiy_m, iiz_m)
-          Ac_new_ms(1:3, iix_m, iiy_m, iiz_m) = 0d0
-       end do
-       end do
-       end do
-!$omp end parallel do
+    iy_m = ny_origin_m
+    iz_m = nz_origin_m
+
+    if(iflag==1) then
+
+       do ipt = npt_intpl_E-1,2,-1
+          E_hist_m(:,:,ipt) = E_hist_m(:,:,ipt-1)
+       enddo
+       E_hist_m(:,:,1) = E_m(:,:)
+       if(flag_use_absorb_bound)then
+       if(ABC_method=="Mur") then
+          E_last(:,nx1_m:nx1_m+1,iy_m,iz_m) = E_ms(:,nx1_m:nx1_m+1,iy_m,iz_m)
+          E_last(:,nx2_m-1:nx2_m,iy_m,iz_m) = E_ms(:,nx2_m-1:nx2_m,iy_m,iz_m)
+          B_last(:,nx1_m:nx1_m+1,iy_m,iz_m) = B_ms(:,nx1_m:nx1_m+1,iy_m,iz_m)
+          B_last(:,nx2_m-1:nx2_m,iy_m,iz_m) = B_ms(:,nx2_m-1:nx2_m,iy_m,iz_m)
+       else if(ABC_method=="PML") then
+          E_last(:,:,iy_m,iz_m) = E_ms(:,:,iy_m,iz_m)
+          B_last(:,:,iy_m,iz_m) = B_ms(:,:,iy_m,iz_m)
+       endif
+       endif
+
+    else
+       E_ms(:,:,:,:) = E_last(:,:,:,:) 
+       B_ms(:,:,:,:) = B_last(:,:,:,:)
     endif
 
 !$omp parallel do collapse(3) default(shared) private(iix_m, iiy_m, iiz_m)
-       do iiz_m = nz1_m, nz2_m
-       do iiy_m = ny1_m, ny2_m
-       do iix_m = nx1_m, nx2_m
-          Jm_old_ms(1:3, iix_m, iiy_m, iiz_m) = Jm_ms    (1:3, iix_m, iiy_m, iiz_m)
-          Jm_ms    (1:3, iix_m, iiy_m, iiz_m) = Jm_new_ms(1:3, iix_m, iiy_m, iiz_m)
-          Jm_new_ms(1:3, iix_m, iiy_m, iiz_m) = 0d0
-       end do
-       end do
-       end do
+    do iiz_m = nz1_m, nz2_m
+    do iiy_m = ny1_m, ny2_m
+    do iix_m = nx1_m, nx2_m
+       Jm_old_ms(1:3,iix_m,iiy_m,iiz_m) = Jm_ms    (1:3,iix_m,iiy_m,iiz_m)
+       Jm_ms    (1:3,iix_m,iiy_m,iiz_m) = Jm_new_ms(1:3,iix_m,iiy_m,iiz_m)
+       Jm_new_ms(1:3,iix_m,iiy_m,iiz_m) = 0d0
+    end do
+    end do
+    end do
 !$omp end parallel do
 
 !$omp parallel do default(shared) private(iimacro, iix_m, iiy_m, iiz_m)
@@ -716,43 +767,25 @@ contains
     end do
 !$omp end parallel do
 
-  end subroutine proceed_ms_variables_omp
+  end subroutine proceed_ms_variables_omp_EB
 
-
-  subroutine assign_mp_variables_omp()
+  subroutine assign_mp_variables_omp_EB()
     implicit none
     integer :: iix_m, iiy_m, iiz_m, iimacro
 
-    if(flag_use_E_B) then
-!$omp parallel do default(shared) private(iimacro, iix_m, iiy_m, iiz_m)
-       do iimacro = 1, nmacro
-          iix_m = macropoint(1,iimacro)
-          iiy_m = macropoint(2,iimacro)
-          iiz_m = macropoint(3,iimacro)
-          !! Assign the E and H field into the local macropoint variables
-          E_m(1:3,iimacro) = matmul(trans_mat(1:3,1:3),E_ms(1:3,iix_m,iiy_m,iiz_m))
-          B_m(1:3,iimacro) = matmul(trans_mat(1:3,1:3),B_ms(1:3,iix_m,iiy_m,iiz_m))
-       end do
+!$omp parallel do default(shared) private(iimacro,iix_m,iiy_m,iiz_m)
+    do iimacro = 1, nmacro
+       iix_m = macropoint(1,iimacro)
+       iiy_m = macropoint(2,iimacro)
+       iiz_m = macropoint(3,iimacro)
+       !! Assign the E and H field into the local macropoint variables
+       E_m_bk(1:3,iimacro) = E_m(1:3,iimacro)
+       E_m(1:3,iimacro) = matmul(trans_mat(1:3,1:3),E_ms(1:3,iix_m,iiy_m,iiz_m))
+       B_m(1:3,iimacro) = matmul(trans_mat(1:3,1:3),B_ms(1:3,iix_m,iiy_m,iiz_m))
+    end do
 !$omp end parallel do
 
-    else
-!$omp parallel do default(shared) private(iimacro, iix_m, iiy_m, iiz_m)
-       do iimacro = 1, nmacro
-          iix_m = macropoint(1, iimacro)
-          iiy_m = macropoint(2, iimacro)
-          iiz_m = macropoint(3, iimacro)
-          !! Assign the vector potential into the local macropoint variables
-          !Ac_m(1:3, iimacro) = Ac_ms(1:3, iix_m, iiy_m, iiz_m)
-          !Ac_new_m(1:3, iimacro) = Ac_new_ms(1:3, iix_m, iiy_m, iiz_m)
-          !Ac_old_m(1:3, iimacro) = Ac_old_ms(1:3, iix_m, iiy_m, iiz_m)
-          Ac_m(1:3, iimacro)     = matmul(trans_mat(1:3,1:3),Ac_ms(    1:3, iix_m, iiy_m, iiz_m))
-          Ac_new_m(1:3, iimacro) = matmul(trans_mat(1:3,1:3),Ac_new_ms(1:3, iix_m, iiy_m, iiz_m))
-          Ac_old_m(1:3, iimacro) = matmul(trans_mat(1:3,1:3),Ac_old_ms(1:3, iix_m, iiy_m, iiz_m))
-       end do
-!$omp end parallel do
-    endif
-
-  end subroutine assign_mp_variables_omp
+  end subroutine assign_mp_variables_omp_EB
   
   
   subroutine store_data_local_ac_jm()
@@ -761,11 +794,7 @@ contains
 !$omp parallel do default(shared) private(iimacro)
     do iimacro = nmacro_s, nmacro_e
       !! Store data_local_Ac, data_local_Jm
-      if(flag_use_E_B) then
-         data_local_Ac(1:3,iimacro,iter) = E_m(1:3,iimacro)
-      else
-         data_local_Ac(1:3,iimacro,iter) = Ac_m(1:3,iimacro)
-      endif
+      data_local_Ac(1:3,iimacro,iter) = E_m(1:3,iimacro)
       data_local_jm(1:3, iimacro, iter) = Jm_m(1:3, iimacro)
     end do
 !$omp end parallel do
@@ -782,7 +811,6 @@ contains
     iproc = mod(index, nproc_size_global)
     ipos = (index - iproc) / nproc_size_global
     if (iproc == nproc_id_global) then
-    if(flag_use_E_B) then
 !$omp parallel do collapse(3) default(shared) private(iiy_m, iix_m, iiz_m)
         do iiz_m = nz1_m, nz2_m
         do iiy_m = ny1_m, ny2_m
@@ -798,24 +826,6 @@ contains
         end do
         end do
 !$omp end parallel do
-
-    else
-!$omp parallel do collapse(3) default(shared) private(iiy_m, iix_m, iiz_m)
-        do iiz_m = nz1_m, nz2_m
-        do iiy_m = ny1_m, ny2_m
-        do iix_m = nx1_m, nx2_m
-            data_out(1:3, iix_m, iiy_m, iiz_m, ipos) = Ac_ms(1:3, iix_m, iiy_m, iiz_m)
-            data_out(4:6, iix_m, iiy_m, iiz_m, ipos) = Elec_ms(1:3, iix_m, iiy_m, iiz_m)
-            data_out(7:9, iix_m, iiy_m, iiz_m, ipos) = Bmag_ms(1:3, iix_m, iiy_m, iiz_m)
-            data_out(10:12, iix_m, iiy_m, iiz_m, ipos) = Jm_ms(1:3, iix_m, iiy_m, iiz_m)
-            data_out(13, iix_m, iiy_m, iiz_m, ipos) = Energy_elec_ms(iix_m, iiy_m, iiz_m)
-            data_out(14, iix_m, iiy_m, iiz_m, ipos) = Energy_joule_ms(iix_m, iiy_m, iiz_m)
-            data_out(15, iix_m, iiy_m, iiz_m, ipos) = Energy_elemag_ms(iix_m, iiy_m, iiz_m)
-        end do
-        end do
-        end do
-!$omp end parallel do
-    end if
     end if
   end subroutine
   
@@ -923,13 +933,8 @@ contains
     implicit none
     ! Export the Ac field of detecting point
     if(comm_is_root(nproc_id_global)) then
-    if(flag_use_E_B) then
        data_vac_Ac(1:3, 1, iter) = E_ms(1:3,ix_detect_l,iy_detect,iz_detect)
        data_vac_Ac(1:3, 2, iter) = E_ms(1:3,ix_detect_r,iy_detect,iz_detect)
-    else
-       data_vac_Ac(1:3, 1, iter) = Ac_ms(1:3,ix_detect_l,iy_detect,iz_detect)
-       data_vac_Ac(1:3, 2, iter) = Ac_ms(1:3,ix_detect_r,iy_detect,iz_detect)
-    end if
     end if
   end subroutine store_data_vac_ac
   
@@ -1043,17 +1048,12 @@ contains
         
           write(fh_ac_m, "('#',1X,A,':',3(1X,I6))") "Macropoint", macropoint(1:3, iimacro)
           write(fh_ac_m, '("#",1X,A,":",1X,A)') "Jm", "Matter current density"
-          if(flag_use_E_B) then
-             write(fh_ac_m, '("#",1X,A,":",1X,A)') "E", "External electric field"
-          else
-             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Ac", "External vector potential field"
-          endif
+          write(fh_ac_m, '("#",1X,A,":",1X,A)') "E", "External electric field"
           write(fh_ac_m, '("#",1X,A,":",1X,A)') "Tmp", "Temperature"
           write(fh_ac_m, '("#",1X,A,":",1X,A)') "Uene", "Potential energy(including field interaction)/(unit cell)"
           write(fh_ac_m, '("#",1X,A,":",1X,A)') "Tene", "Kinetic energy/(unit cell)"
 
-          if(flag_use_E_B) then
-             write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
+          write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
                   & 1, "Time", trim(t_unit_time%name), &
                   & 2, "E_x", trim(t_unit_elec%name), &
                   & 3, "E_y", trim(t_unit_elec%name), &
@@ -1064,43 +1064,19 @@ contains
                   & 8, "Tmp",       "K",  &
                   & 9, "Uene",      "au", &
                   & 10,"Uene+Tene", "au"
-             write(fh_ac_m,*)
-             do iiter = 0, Nt
-                write(fh_ac_m, "(F16.8,9(1X,ES22.14E3,1X))",advance='no') &
+          write(fh_ac_m,*)
+          do iiter = 0, Nt
+             write(fh_ac_m, "(F16.8,9(1X,ES22.14E3,1X))",advance='no') &
                      & iiter * dt * t_unit_time%conv, &
                      & data_local_Ac(1:3, iimacro, iiter) * t_unit_elec%conv, &
                      & data_local_jm(1:3, iimacro, iiter) * t_unit_current%conv, &
                      & data_local_MD(1:3, iimacro, iiter)
-                write(fh_ac_m,*)
-             end do !iiter
-
-          else
-             write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
-                  & 1, "Time", trim(t_unit_time%name), &
-                  & 2, "Ac_x", trim(t_unit_ac%name), &
-                  & 3, "Ac_y", trim(t_unit_ac%name), &
-                  & 4, "Ac_z", trim(t_unit_ac%name), &
-                  & 5, "Jm_x", trim(t_unit_current%name), &
-                  & 6, "Jm_y", trim(t_unit_current%name), &
-                  & 7, "Jm_z", trim(t_unit_current%name), &
-                  & 8, "Tmp",       "K",  &
-                  & 9, "Uene",      "au", &
-                  & 10,"Uene+Tene", "au"
              write(fh_ac_m,*)
-             do iiter = 0, Nt
-                write(fh_ac_m, "(F16.8,9(1X,ES22.14E3,1X))",advance='no') &
-                     & iiter * dt * t_unit_time%conv, &
-                     & data_local_Ac(1:3, iimacro, iiter) * t_unit_ac%conv, &
-                     & data_local_jm(1:3, iimacro, iiter) * t_unit_current%conv, &
-                     & data_local_MD(1:3, iimacro, iiter)
-                write(fh_ac_m,*)
-             end do !iiter
+          end do !iiter
 
-          endif
           close(fh_ac_m)
 
           endif !<--if(imacro.ge.nmacro_s .and. imacro.le.nmacro_e)
-
           endif ! nproc_id_tdks
 
        enddo !iimacro
@@ -1123,12 +1099,11 @@ contains
           write(fh_ac_m, '("#",1X,A)') "Local variable at macro point"
           write(fh_ac_m, "('#',1X,A,':',3(1X,I6))") "Macropoint", macropoint(1:3, iimacro)
 
-          if(flag_use_E_B) then
-             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Jm", "Matter current density"
-             write(fh_ac_m, '("#",1X,A,":",1X,A)') "E", "External electric field"
-             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Tmp", "Temperature"
+          write(fh_ac_m, '("#",1X,A,":",1X,A)') "Jm", "Matter current density"
+          write(fh_ac_m, '("#",1X,A,":",1X,A)') "E", "External electric field"
+          write(fh_ac_m, '("#",1X,A,":",1X,A)') "Tmp", "Temperature"
 
-             write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
+          write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
                   & 1, "Time", trim(t_unit_time%name), &
                   & 2, "E_x", trim(t_unit_elec%name), &
                   & 3, "E_y", trim(t_unit_elec%name), &
@@ -1139,46 +1114,19 @@ contains
                   & 8, "Tmp",       "K",  &
                   & 9, "Uene",      "au", &
                   & 10,"Uene+Tene", "au"
-             write(fh_ac_m,*)
-             do iiter = 0, Nt
-                write(fh_ac_m, "(F16.8,9(1X,E23.15E3,1X))",advance='no') &
+          write(fh_ac_m,*)
+          do iiter = 0, Nt
+             write(fh_ac_m, "(F16.8,9(1X,E23.15E3,1X))",advance='no') &
                      & iiter * dt * t_unit_time%conv, &
                      & data_local_Ac(1:3, iimacro, iiter) * t_unit_elec%conv, &
                      & data_local_jm(1:3, iimacro, iiter) * t_unit_current%conv, &
                      & data_local_MD(1:3, iimacro, iiter)
-                write(fh_ac_m,*)
-             end do !iiter
-
-          else
-             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Jm", "Matter current density"
-             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Ac", "External vector potential field"
-             write(fh_ac_m, '("#",1X,A,":",1X,A)') "Tmp", "Temperature"
-
-             write(fh_ac_m, '("#",99(1X,I0,":",A,"[",A,"]"))',advance='no') &
-                  & 1, "Time", trim(t_unit_time%name), &
-                  & 2, "Ac_x", trim(t_unit_ac%name), &
-                  & 3, "Ac_y", trim(t_unit_ac%name), &
-                  & 4, "Ac_z", trim(t_unit_ac%name), &
-                  & 5, "Jm_x", trim(t_unit_current%name), &
-                  & 6, "Jm_y", trim(t_unit_current%name), &
-                  & 7, "Jm_z", trim(t_unit_current%name), &
-                  & 8, "Tmp",       "K",  &
-                  & 9, "Uene",      "au", &
-                  & 10,"Uene+Tene", "au"
              write(fh_ac_m,*)
-             do iiter = 0, Nt
-                write(fh_ac_m, "(F16.8,9(1X,E23.15E3,1X))",advance='no') &
-                     & iiter * dt * t_unit_time%conv, &
-                     & data_local_Ac(1:3, iimacro, iiter) * t_unit_ac%conv, &
-                     & data_local_jm(1:3, iimacro, iiter) * t_unit_current%conv, &
-                     & data_local_MD(1:3, iimacro, iiter)
-                write(fh_ac_m,*)
-             end do !iiter
-          endif
+          end do !iiter
+
           close(fh_ac_m)
 
           endif !<--if(imacro.ge.nmacro_s .and. imacro.le.nmacro_e)
-
           endif ! nproc_id_tdks
 
        enddo !i
@@ -1200,15 +1148,13 @@ contains
       write(file_ac_vac,"(A, A, '_Ac_vac.data')") trim(dir_ms_RT_Ac),trim(SYSname)
       fh_ac_vac = open_filehandle(file_ac_vac)
 
-
-      if(flag_use_E_B) then
-         write(fh_ac_vac, '("#",1X,A)') "E(t) vacuum region"
-         write(fh_ac_vac, '("#",1X,A)') "Data of E(t) field at the end of media"
+      write(fh_ac_vac, '("#",1X,A)') "E(t) vacuum region"
+      write(fh_ac_vac, '("#",1X,A)') "Data of E(t) field at the end of media"
       
-         write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "L", ix_detect_l, iy_detect, iz_detect
-         write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "R", ix_detect_r, iy_detect, iz_detect
+      write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "L", ix_detect_l, iy_detect, iz_detect
+      write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "R", ix_detect_r, iy_detect, iz_detect
       
-         write(fh_ac_vac, '("#",99(1X,I0,":",A,"[",A,"]"))') &
+      write(fh_ac_vac, '("#",99(1X,I0,":",A,"[",A,"]"))') &
               & 1, "Time", trim(t_unit_time%name), &
               & 2, "E_x(L)", trim(t_unit_elec%name), &
               & 3, "E_y(L)", trim(t_unit_elec%name), &
@@ -1216,35 +1162,13 @@ contains
               & 5, "E_x(R)", trim(t_unit_elec%name), &
               & 6, "E_y(R)", trim(t_unit_elec%name), &
               & 7, "E_z(R)", trim(t_unit_elec%name)
-         do iiter = 0, Nt
-            write(fh_ac_vac, "(F16.8,6(1X,E23.15E3,1X))") &
+      do iiter = 0, Nt
+         write(fh_ac_vac, "(F16.8,6(1X,E23.15E3,1X))") &
                  & iiter * dt * t_unit_time%conv, &
                  & data_vac_Ac(1:3, 1, iiter) * t_unit_elec%conv, &
                  & data_vac_Ac(1:3, 2, iiter) * t_unit_elec%conv
-         end do
+      end do
 
-      else
-         write(fh_ac_vac, '("#",1X,A)') "Ac vacuum region"
-         write(fh_ac_vac, '("#",1X,A)') "Data of Ac field at the end of media"
-      
-         write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "L", ix_detect_l, iy_detect, iz_detect
-         write(fh_ac_vac, "('#',1X,A,':',3(1X,I6))") "R", ix_detect_r, iy_detect, iz_detect
-      
-         write(fh_ac_vac, '("#",99(1X,I0,":",A,"[",A,"]"))') &
-              & 1, "Time", trim(t_unit_time%name), &
-              & 2, "Ac_x(L)", trim(t_unit_ac%name), &
-              & 3, "Ac_y(L)", trim(t_unit_ac%name), &
-              & 4, "Ac_z(L)", trim(t_unit_ac%name), &
-              & 5, "Ac_x(R)", trim(t_unit_ac%name), &
-              & 6, "Ac_y(R)", trim(t_unit_ac%name), &
-              & 7, "Ac_z(R)", trim(t_unit_ac%name)
-         do iiter = 0, Nt
-            write(fh_ac_vac, "(F16.8,6(1X,E23.15E3,1X))") &
-                 & iiter * dt * t_unit_time%conv, &
-                 & data_vac_Ac(1:3, 1, iiter) * t_unit_ac%conv, &
-                 & data_vac_Ac(1:3, 2, iiter) * t_unit_ac%conv
-         end do
-      endif
       close(fh_ac_vac)
     end if
     call comm_sync_all  
@@ -1467,23 +1391,45 @@ contains
   end subroutine
 
   subroutine cal_force_energy_CRK_MS(imacro)
-    use force_field_CRK, only: Qai, Rxyz_wX, cal_force_energy_CRK
+    use force_field_CRK, only: Qai,force_intra,Uene_intra,Rxyz_wX,cal_force_energy_CRK,natom_wX_mol
     implicit none
-    integer :: ia,imacro,imol
-   !real(8) :: Eem
+    integer :: ixyz, ia,imacro,imol,ia_wX, ipt, k, iflag_update_Rxyz
+    real(8) :: Eti(10) !, Qai_intpl, Qai_hist(10)
 
     !electric field used in CRK force field
-    if(flag_use_E_B) then
-      !Et(:)= E_m(:,imacro) !unstable to be NaN
-       Et(:)= 0.5d0 * ( E_m(:,imacro) + E_last_m(:,imacro) )
+    if(iter2==1) then
+       do ixyz=1,3
+          k=0
+          do ipt = npt_intpl_E-1,1,-1
+             k=k+1
+             Eti(k) = E_hist_m(ixyz,imacro,ipt)
+          enddo
+          k=k+1
+          Eti(k) = E_m(ixyz,imacro)
+          call interpolate(Et(ixyz),Eti,npt_intpl_E)
+       enddo
     else
-      !Et(:)= -(Ac_new_m(:,imacro)-Ac_m(:,imacro))/dt   !unstable to be NaN
-       Et(:)= -(Ac_new_m(:,imacro)-Ac_old_m(:,imacro))/(2*dt)
+       Et(:)= E_m(:,imacro)
     endif
-   !Eem  = aLxyz*sum(Et(:)**2)/(8.d0*Pi)
+   !if(imacro==1)write(*,*)"aho",iter2,real(Et(2)),real(Et(3))  !for check
+    E_m_iter(:,imacro) = Et(:)
 
+
+    if(iter2==1) then
+       iflag_update_Rxyz = 0
+    else 
+       iflag_update_Rxyz = 1  !flag to skip intramolecular interaction
+       force_intra(:,:) = force_intra_m(:,:,imacro)
+       Uene_intra = Uene_intra_ms(imacro)
+    endif
     Rion(:,:) = Rion_m(:,:,imacro)
-    call cal_force_energy_CRK
+
+    call cal_force_energy_CRK(iflag_update_Rxyz)
+
+    if(iter2==1) then
+       force_intra_m(:,:,imacro) = force_intra(:,:)
+       Uene_intra_ms(imacro) = Uene_intra
+    endif
 
     do ia=1,NI
        force_m(:,ia,imacro) = force(:,ia)
@@ -1498,27 +1444,46 @@ contains
        Rxyz_wX_ms(:,:,imol,imacro)= Rxyz_wX(:,:,imol)
     enddo
     Uene_ms(imacro) = Uene
-   !Eall_ms(imacro) = Uene + Eem
     Eall_ms(imacro) = Uene  !electric field energy is included already(need check)
 
   end subroutine
 
-  subroutine cal_dipole_moment_current_ms(dipole_mom,current_matter,dt,imacro)
+  subroutine cal_dipole_moment_ms(dipole_mom,dt,imacro)
     ! dipole_mom : (in & out)
-    use force_field_CRK, only: Qai,Rxyz_wX,natom_wX_mol,Vuc
+    use force_field_CRK, only: Qai, Rxyz_wX, natom_wX_mol, Vuc
     implicit none
     integer :: imol,ia_wX,imacro
-    real(8) :: dipole_mom(3), current_matter(3), dt
-    real(8) :: velocity_wX(3,4,nmol), dQaidt(4,nmol) !, dipole_mom_last(3)
+    real(8) :: dipole_mom(3), dt
     
-    !dipole_mom_last(:) = dipole_mom(:)
+    !dipole moment in unit cell
+    dipole_mom(:) = 0d0
+    do imol=1,nmol
+    do ia_wX=1,natom_wX_mol(imol)
+       dipole_mom(:) = dipole_mom(:) &
+                     + Qai_ms(ia_wX,imol,imacro)*Rxyz_wX_ms(:,ia_wX,imol,imacro)
+    enddo
+    enddo
+    dipole_mom(:) = dipole_mom(:)/aLxyz
+
+  end subroutine
+
+  subroutine cal_dipole_moment_current_ms_EB(dipole_mom,current_matter,dt,imacro)
+    ! dipole_mom : (in & out)
+    ! claculate Jm(t+dt/2) for use of E(t),B(t)
+    use force_field_CRK, only: Qai,Rxyz_wX,natom_wX_mol,Vuc
+    implicit none
+    integer :: imol,ia_wX,imacro, ii,ia
+    real(8) :: dipole_mom(3), current_matter(3), dt
+    real(8) :: velocity_wX(3,4,nmol), dQaidt(4,nmol), Qai_mid(4,nmol)
 
     do imol=1,nmol
-       dQaidt(:,imol) = (Qai_ms(:,imol,imacro) - Qai_old_ms(:,imol,imacro))/dt
+       dQaidt(:,imol) = (Qai_ms(:,imol,imacro) - Qai_bk_ms(:,imol,imacro))/dt
+       Qai_mid(:,imol)= (Qai_ms(:,imol,imacro) + Qai_bk_ms(:,imol,imacro))*0.5d0
     enddo
 
-    velocity(:,:) = velocity_m(:,:,imacro)
-    Rion(:,:)     = Rion_m(:,:,imacro)
+
+    velocity(:,:) = velocity_m_mid(:,:,imacro)
+    Rion(:,:)     = Rion_m_mid(:,:,imacro)
     call cal_vel_siteX(velocity_wX)
 
     !dipole moment in unit cell
@@ -1527,10 +1492,10 @@ contains
     do imol=1,nmol
     do ia_wX=1,natom_wX_mol(imol)
        dipole_mom(:) = dipole_mom(:) &
-                     + Qai_ms(ia_wX,imol,imacro)*Rxyz_wX_ms(:,ia_wX,imol,imacro)
+                     + Qai_mid(ia_wX,imol)*Rxyz_wX_ms_mid(:,ia_wX,imol,imacro)
        current_matter(:) = current_matter(:) &
-                     -dQaidt(ia_wX,imol) * Rxyz_wX_ms(:,ia_wX,imol,imacro) &
-                     - Qai_ms(ia_wX,imol,imacro) * velocity_wX(:,ia_wX,imol)
+                     -dQaidt(ia_wX,imol) * Rxyz_wX_ms_mid(:,ia_wX,imol,imacro) &
+                     - Qai_mid(ia_wX,imol) * velocity_wX(:,ia_wX,imol)
     enddo
     enddo
     dipole_mom(:)     = dipole_mom(:)/aLxyz
@@ -1538,6 +1503,19 @@ contains
 
     !matter current defined by positive charge-->minus sign (less accurate/rough)
     !current_matter(:) = -(dipole_mom(:) - dipole_mom_last(:))/dt
+
+    if(flag_method_newton_Et) then
+       do imol=1,nmol
+          ii = sum(natom_wX_mol(1:imol)) - natom_wX_mol(imol)
+          do ia_wX=1,natom_wX_mol(imol)
+             ia = ii+ia_wX
+             vpr(:,ia,imacro) = 0.5d0*velocity_wX(:,ia_wX,imol) + Rxyz_wX_ms_mid(:,ia_wX,imol,imacro)/dt
+             vmr(:,ia,imacro) = 0.5d0*velocity_wX(:,ia_wX,imol) - Rxyz_wX_ms_mid(:,ia_wX,imol,imacro)/dt
+             rvec(:,ia,imacro)  = Rxyz_wX_ms(:,ia_wX,imol,imacro)
+             Qvec_bk(ia,imacro) = Qai_bk_ms(ia_wX,imol,imacro)
+          enddo
+       enddo
+    endif
 
   end subroutine
 
@@ -1608,364 +1586,67 @@ contains
 end subroutine cmd_maxwell_ms
 
 !===========================================================
-subroutine dt_evolve_Ac_1d_cmd_PML
-  use Global_variables
+
+subroutine save_matrix_for_newton_method(imacro)
+  use force_field_CRK, only: NI_wX, Kmat, invJmat
   implicit none
-  integer :: ix, iy, iz
-  real(8) :: sgm_pml, tmp1, coef1A,coef2A,rr(3)
+  integer :: ia,imacro
+  real(8) :: vec2_tmp(NI_wX), vec3_tmp(NI_wX)
 
-  iy = ny_origin_m
-  iz = nz_origin_m
-
-  !Memo:
-  !Ac does not become zero after pulse ends, probably because 
-  !the error accumurates during the numerical integration by time? be carefull.
-  if(flag_use_light_source) call apply_light_source_1d_J
-
-  ! Reference:
-  ! D.Zhou,et al., IEEE Photo. Tech. Lett. 13, 1041 (2001) 
-  ! Y. S. Rickard, et al. IEEE Tran. Anten. Prop., 51, 286, (2003)
-
-  ! D1_pml: ix means ix+1/2, it means it+1/2
-  ! D2_pml: ix means ix, it means it+1/2
-  D1_last(:,:,:,:) = D1_pml(:,:,:,:)
-  D2_last(:,:,:,:) = D2_pml(:,:,:,:)
-  call comm_sync_all
-
-  !update for D1
-!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
-  do ix = nx1_m, nx2_m
-     if(ix.lt.nx1_pml) then
-        sgm_pml = sgm_max_E_pml * (dble(nx1_pml-(ix+0.5d0))/dble(nx_pml))**M_pml
-     else if(ix.ge.nx2_pml) then
-        sgm_pml = sgm_max_E_pml * (dble((ix+0.5d0)-nx2_pml)/dble(nx_pml))**M_pml
-     else
-        sgm_pml = 0d0
-     endif
-
-     tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
-     coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
-     coef2A  = dt/HX_m/tmp1
-     D1_pml(:,ix,iy,iz) = coef1A *D1_last(:,ix,iy,iz) + coef2A *(Ac_ms(:,ix+1,iy,iz) - Ac_ms(:,ix,iy,iz))
+  do ia=1,NI_wX
+     vec2_tmp(ia) = sum( Kmat(ia,:)*rvec(2,:,imacro) )
+     vec3_tmp(ia) = sum( Kmat(ia,:)*rvec(3,:,imacro) )
   enddo
-!$omp end parallel do
 
-  call comm_sync_all
-
-  !update for D2
-!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
-  do ix = nx1_m, nx2_m
-     if(ix.le.nx1_pml) then
-        sgm_pml = sgm_max_E_pml * (dble(nx1_pml-ix)/dble(nx_pml))**M_pml
-     else if(ix.ge.nx2_pml) then
-        sgm_pml = sgm_max_E_pml * (dble(ix-nx2_pml)/dble(nx_pml))**M_pml
-     else
-        sgm_pml = 0d0
-     endif
-
-     tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
-     coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
-     coef2A  = 1d0/HX_m/tmp1
-     D2_pml(:,ix,iy,iz) = coef1A *D2_last(:,ix,iy,iz)   &
-                 + coef2A *( (D1_pml(:,ix,iy,iz) - D1_pml(:,ix-1,iy,iz))    &
-                           - (D1_last(:,ix,iy,iz)- D1_last(:,ix-1,iy,iz)) )
+  do ia=1,NI_wX
+     vec2_tmp_m(ia,imacro) = sum( invJmat(ia,:) * vec2_tmp(:) )
+     vec3_tmp_m(ia,imacro) = sum( invJmat(ia,:) * vec3_tmp(:) )
   enddo
-!$omp end parallel do
 
-  call comm_sync_all
-
-  !update for Ac
-!$omp parallel do default(shared) private(ix,coef1A,coef2A,rr)
-  do ix = nx1_m, nx2_m
-
-     coef1A = 4d0*pi*dt*dt
-     coef2A = (c_light*dt)**2
-
-     rr(:) = ( D2_pml(:,ix,iy,iz) - D2_last(:,ix,iy,iz) ) / dt
-     rr(1) = 0d0
-
-     Ac_new_ms(:,ix,iy,iz) = 2d0 * Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz) &
-                           & -Jm_ms(:,ix,iy,iz) * coef1A + rr(:)*coef2A
-  enddo
-!$omp end parallel do
-
-    !termination
-    Ac_new_ms(:,nx1_m,iy,iz) = 0d0
-    Ac_new_ms(:,nx2_m,iy,iz) = 0d0
+end subroutine
 
 
-end subroutine dt_evolve_Ac_1d_cmd_PML
+subroutine interpolate(Xintpl,Xi,npt)
+  !Lagrange interpolation
+  integer :: npt
+  real(8) :: Xintpl, Xi(10),tmp(10) !Et3,Et2,Et1, tmp1,tmp2
 
-!===========================================================
-subroutine dt_evolve_Ac_1d_cmd
-  use Global_variables
-  implicit none
-  integer :: ix_m
-  integer :: iy_m
-  integer :: iz_m
-  real(8) :: rr(3) ! rot rot Ac
+  if(     npt==2) then
+     tmp(2) = dble((3-1))/dble((2-1)) * Xi(2)
+     tmp(1) = dble((3-2))/dble((1-2)) * Xi(1)
+     Xintpl = tmp(1) + tmp(2)
 
-  iz_m = nz_origin_m
-  iy_m = ny_origin_m
+  else if(npt==3) then
+     tmp(3) = dble( (4-2)*(4-1))/dble( (3-2)*(3-1) ) * Xi(3)
+     tmp(2) = dble( (4-3)*(4-1))/dble( (2-3)*(2-1) ) * Xi(2)
+     tmp(1) = dble( (4-3)*(4-2))/dble( (1-3)*(1-2) ) * Xi(1)
+     Xintpl = tmp(1) + tmp(2) + tmp(3)
 
-  !Memo:
-  !Ac does not become zero after pulse ends, probably because 
-  !the error accumurates during the numerical integration by time? be carefull.
-  if(flag_use_light_source) call apply_light_source_1d_J
+  else if(npt==4) then
+     tmp(4) = dble( (5-3)*(5-2)*(5-1))/dble( (4-3)*(4-2)*(4-1) ) * Xi(4)
+     tmp(3) = dble( (5-4)*(5-2)*(5-1))/dble( (3-4)*(3-2)*(3-1) ) * Xi(3)
+     tmp(2) = dble( (5-4)*(5-3)*(5-1))/dble( (2-4)*(2-3)*(2-1) ) * Xi(2)
+     tmp(1) = dble( (5-4)*(5-3)*(5-2))/dble( (1-4)*(1-3)*(1-2) ) * Xi(1)
+     Xintpl = tmp(1) + tmp(2) + tmp(3) + tmp(4)
 
-!$omp parallel do default(shared) private(ix_m,rr)
-  do ix_m = nx1_m, nx2_m
-    rr(1) = 0d0
-    rr(2:3) = -( &
-            &      + Ac_ms(2:3,ix_m+1, iy_m, iz_m) &
-            & -2d0 * Ac_ms(2:3,ix_m,   iy_m, iz_m) &
-            &      + Ac_ms(2:3,ix_m-1, iy_m, iz_m) &
-            & ) * (1d0 / HX_m ** 2)
-    Ac_new_ms(:,ix_m, iy_m, iz_m) = (2 * Ac_ms(:,ix_m, iy_m, iz_m) - Ac_old_ms(:,ix_m, iy_m, iz_m) &
-      & -Jm_ms(:,ix_m, iy_m, iz_m) * 4.0*pi*(dt**2) - rr(:)*(c_light*dt)**2 )
-  end do
-!$omp end parallel do
+  endif
 
-  if(flag_use_absorb_bound) call apply_absorb_bound_1d_Ac
-  
-  return
-
-contains 
-
-  subroutine  apply_absorb_bound_1d_Ac
-     if(     ABC_method=="Mur") then
-        call  apply_absorb_bound_1d_Mur_Ac
-     else if(ABC_method=="PML") then
-        call  apply_absorb_bound_1d_PML_Ac
-     endif
-  end subroutine
-
-  subroutine  apply_absorb_bound_1d_Mur_Ac   ! 1-th Mur
-    implicit none
-    integer :: ix1,ix2, iy, iz
-    real(8) :: tmp
-
-    iy = ny_origin_m
-    iz = nz_origin_m
-
-    tmp = ( c_light * dt - HX_m ) / ( c_light * dt + HX_m )
-
-    !right absorbing boundary
-    ix1=nx2_m
-    ix2=nx2_m-1
-    Ac_new_ms(:,ix1,iy,iz) = Ac_ms(:,ix2,iy,iz) + tmp* ( Ac_new_ms(:,ix2,iy,iz) - Ac_ms(:,ix1,iy,iz))
-
-    !left absorbing boundary
-    ix1=nx1_m
-    ix2=nx1_m+1
-    Ac_new_ms(:,ix1,iy,iz) = Ac_ms(:,ix2,iy,iz) + tmp* ( Ac_new_ms(:,ix2,iy,iz) - Ac_ms(:,ix1,iy,iz))
-
-  end subroutine apply_absorb_bound_1d_Mur_Ac
-
-  subroutine  apply_absorb_bound_1d_PML_Ac
-    !! this is PML for wave equation or scalar FDTD 
-    !!(D.Zhou,et al., IEEE Photo. Tech. Lett. 13, 1041 (2001))
-    implicit none
-    integer :: ix,iy,iz
-    real(8) :: sgm_pml, tmp1,coef1A, coef2A
-
-    iy = ny_origin_m
-    iz = nz_origin_m
-
-    ! D1_pml: ix means ix+1/2, it means it+1/2
-    ! D2_pml: ix means ix, it means it+1/2
-
-    D1_last(:,:,:,:) = D1_pml(:,:,:,:)
-    D2_last(:,:,:,:) = D2_pml(:,:,:,:)
-
-!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
-    do ix = nx1_m, nx2_m
-       if(ix.lt.nx1_pml) then
-          sgm_pml = sgm_max_E_pml * (dble(nx1_pml-(ix+0.5d0))/dble(nx_pml))**M_pml
-       else if(ix.ge.nx2_pml) then
-          sgm_pml = sgm_max_E_pml * (dble((ix+0.5d0)-nx2_pml)/dble(nx_pml))**M_pml
-       else
-          sgm_pml = 0d0
-       endif
-       tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
-       coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
-       coef2A  = dt/HX_m/tmp1 !* c_light
-       D1_pml(:,ix,iy,iz) = coef1A *D1_last(:,ix,iy,iz) + coef2A *(Ac_ms(:,ix+1,iy,iz) - Ac_ms(:,ix,iy,iz))
-    enddo
-!$omp end parallel do
-
-!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
-    do ix = nx1_m, nx2_m
-       if(ix.le.nx1_pml) then
-          sgm_pml = sgm_max_E_pml * (dble(nx1_pml-ix)/dble(nx_pml))**M_pml
-       else if(ix.ge.nx2_pml) then
-          sgm_pml = sgm_max_E_pml * (dble(ix-nx2_pml)/dble(nx_pml))**M_pml
-       else
-          sgm_pml = 0d0
-       endif
-       tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
-       coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
-       coef2A  = 1d0/HX_m/tmp1
-       D2_pml(:,ix,iy,iz) = coef1A *D2_last(:,ix,iy,iz)   &
-                    + coef2A *( (D1_pml(:,ix,iy,iz) - D1_pml(:,ix-1,iy,iz))    &
-                              - (D1_last(:,ix,iy,iz)- D1_last(:,ix-1,iy,iz)) )
-    enddo
-!$omp end parallel do
-
-!$omp parallel do default(shared) private(ix,coef1A)
-    do ix = nx1_m, nx1_pml
-       coef1A = c_light * dt  * c_light
-       Ac_new_ms(:,ix,iy,iz) = 2d0*Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz) &
-            &  + coef1A * (D2_pml(:,ix,iy,iz)-D2_last(:,ix,iy,iz))
-    enddo
-!$omp end parallel do
-
-!$omp parallel do default(shared) private(ix,coef1A)
-    do ix = nx2_pml, nx2_m
-       coef1A = c_light * dt  * c_light
-       Ac_new_ms(:,ix,iy,iz) = 2d0*Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz) &
-            &  + coef1A * (D2_pml(:,ix,iy,iz)-D2_last(:,ix,iy,iz))
-    enddo
-!$omp end parallel do
-
-    !termination
-    Ac_new_ms(:,nx1_m,iy,iz) = 0d0
-    Ac_new_ms(:,nx2_m,iy,iz) = 0d0
-
-return
-!-------------------------------------------------------
-
-!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
-    do ix = nx1_m, nx1_pml
-       sgm_pml = sgm_max_E_pml * (dble(nx1_pml-ix)/dble(nx_pml))**M_pml
-       tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
-       coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
-       coef2A  = dt/HX_m/tmp1 !* c_light
-       D1_pml(:,ix,iy,iz) = coef1A *D1_last(:,ix,iy,iz) + coef2A *(Ac_ms(:,ix+1,iy,iz) - Ac_ms(:,ix,iy,iz))
-    enddo
-!$omp end parallel do
-
-!$omp parallel do default(shared) private(ix,sgm_pml,tmp1,coef1A,coef2A)
-    do ix = nx1_m, nx1_pml
-       sgm_pml = sgm_max_E_pml * (dble(nx1_pml-ix)/dble(nx_pml))**M_pml
-       tmp1    =  a_pml + sgm_pml * dt * 2d0 * pi
-       coef1A  = (a_pml - sgm_pml * dt * 2d0 * pi)/tmp1
-       coef2A  = 1d0/HX_m/tmp1
-       D2_pml(:,ix,iy,iz) = coef1A *D2_last(:,ix,iy,iz)   &
-                    + coef2A *( (D1_pml(:,ix,iy,iz) - D1_pml(:,ix-1,iy,iz))    &
-                              - (D1_last(:,ix,iy,iz)- D1_last(:,ix-1,iy,iz)) )
-    enddo
-!$omp end parallel do
-
-!$omp parallel do default(shared) private(ix,coef1A)
-    do ix = nx1_m, nx1_pml
-       coef1A = c_light * dt  * c_light
-       Ac_new_ms(:,ix,iy,iz) = 2d0*Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz) &
-            &  + coef1A * (D2_pml(:,ix,iy,iz)-D2_last(:,ix,iy,iz))
-    enddo
-!$omp end parallel do
-
-    !termination
-!    Ac_new_ms(:,nx1_m,iy,iz) = 0d0
-!    Ac_new_ms(:,nx2_m,iy,iz) = 0d0
-
-  end subroutine
-
-  subroutine  apply_absorb_bound_1d_PML_Ac_NowWork 
-    !! usual simple PML style for vector potential, but it did not work well
-    implicit none
-    integer :: ix,iy,iz
-    real(8) :: sgmE_pml,sgmH_pml, rr(3)
-    real(8) :: tmp1,coef1A, coef2A, coef3A, coef4A, coef5A
-
-    iy = ny_origin_m
-    iz = nz_origin_m
-
-!$omp parallel do default(shared) private(ix,sgmE_pml,sgmH_pml,tmp1,rr,coef1A,coef2A,coef3A,coef4A,coef5A)
-    do ix = nx1_m, nx1_pml
-       tmp1 = (dble(nx1_pml-ix)/dble(nx_pml))**M_pml
-       sgmE_pml = sgm_max_E_pml * tmp1
-      !tmp1 = (dble(nx1_pml-(ix+0.5d0))/dble(nx_pml))**M_pml  !test
-       sgmH_pml = sgm_max_B_pml * tmp1
-
-       coef1A = 1d0/(c_light**2 * dt)
-       coef2A = sgmH_pml/(4d0*pi) + 4d0*pi*sgmE_pml/c_light**2
-       coef3A = sgmE_pml * sgmH_pml * dt
-       coef4A = 4.0*pi*dt/c_light**2
-       coef5A = 1d0 / ( coef1A + 0.5d0*coef2A )
-
-       rr(1) = 0d0
-       rr(2:3) = (   Ac_ms(2:3,ix+1,iy,iz) &
-            & -2d0 * Ac_ms(2:3,ix,  iy,iz) &
-            &      + Ac_ms(2:3,ix-1,iy,iz) ) / HX_m**2
-       Ac_new_ms(:,ix,iy,iz) = coef5A * ( coef1A* (2d0*Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz)) &
-            &  + rr(:)*dt + 0.5d0*coef2A * Ac_old_ms(:,ix,iy,iz) - coef3A * Ac_ms(:,ix,iy,iz)     &
-            &  - coef4A * Jm_ms(:,ix,iy,iz) )
-    end do
-!$omp end parallel do
-
-!$omp parallel do default(shared) private(ix,sgmE_pml,sgmH_pml,tmp1,rr,coef1A,coef2A,coef3A,coef4A,coef5A)
-    do ix = nx2_pml, nx2_m
-       tmp1 = (dble(ix-nx2_pml)/dble(nx_pml))**M_pml
-       sgmE_pml = sgm_max_E_pml * tmp1
-      !tmp1 =  (dble((ix+0.5d0)-nx2_pml)/dble(nx_pml))**M_pml  !test
-       sgmH_pml = sgm_max_B_pml * tmp1
-
-       coef1A = 1d0/(c_light**2 * dt)
-       coef2A = sgmH_pml/(4d0*pi) + 4d0*pi*sgmE_pml/c_light**2
-       coef3A = sgmE_pml * sgmH_pml * dt
-       coef4A = 4.0*pi*dt/c_light**2
-       coef5A = 1d0 / ( coef1A + 0.5d0*coef2A )
-
-       rr(1) = 0d0
-       rr(2:3) = (   Ac_ms(2:3,ix+1,iy,iz) &
-            & -2d0 * Ac_ms(2:3,ix,  iy,iz) &
-            &      + Ac_ms(2:3,ix-1,iy,iz) ) / HX_m**2
-       Ac_new_ms(:,ix,iy,iz) = coef5A * ( coef1A* (2d0*Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz)) &
-            &  + rr(:)*dt + 0.5d0*coef2A * Ac_old_ms(:,ix,iy,iz) - coef3A * Ac_ms(:,ix,iy,iz)     &
-            &  - coef4A * Jm_ms(:,ix,iy,iz) )
-    end do
-!$omp end parallel do
-
-    !termination
-    Ac_new_ms(:,nx1_m,iy,iz) = 0d0
-    Ac_new_ms(:,nx2_m,iy,iz) = 0d0
-
-  end subroutine
-
-end subroutine dt_evolve_Ac_1d_cmd
-
+end subroutine interpolate
 
 !===========================================================
 subroutine dt_evolve_EB_1d_cmd
   use Global_variables
+  use salmon_communication
   implicit none
-  integer :: ix_m,iy_m,iz_m
+  integer :: ix_m,iy_m,iz_m,ix,iy,iz,imacro
   real(8) :: coef1E,coef2E,coef1B,coef2B
+  real(8) :: g(2:3), dgdE(2:3,2:3), inv_dgdE(2:3,2:3), dEn(2:3)
+  real(8) :: vmr2Q, vmr3Q, det, E_m_new_tmp(3,nmacro)
 
   iy_m = ny_origin_m
   iz_m = nz_origin_m
 
-!  !test
-!  E_ms(1,:,:,:)=0d0
-!  B_ms(1,:,:,:)=0d0
-!  E_m(1,:)=0d0
-!  B_m(1,:)=0d0
-
   if(flag_use_light_source) call apply_light_source_1d_J
-
-  E_last_m(:,:) = E_m(:,:)
-  if(flag_use_absorb_bound)then
-     if(ABC_method=="Mur") then
-        E_last(:,nx1_m:nx1_m+1,iy_m,iz_m) = E_ms(:,nx1_m:nx1_m+1,iy_m,iz_m)
-        E_last(:,nx2_m-1:nx2_m,iy_m,iz_m) = E_ms(:,nx2_m-1:nx2_m,iy_m,iz_m)
-        B_last(:,nx1_m:nx1_m+1,iy_m,iz_m) = B_ms(:,nx1_m:nx1_m+1,iy_m,iz_m)
-        B_last(:,nx2_m-1:nx2_m,iy_m,iz_m) = B_ms(:,nx2_m-1:nx2_m,iy_m,iz_m)
-     else if(ABC_method=="PML") then
-        E_last(:,:,iy_m,iz_m) = E_ms(:,:,iy_m,iz_m)
-        B_last(:,:,iy_m,iz_m) = B_ms(:,:,iy_m,iz_m)
-     endif
-  endif
 
   coef1E = c_light*dt /HX_m
   coef2E = 4*pi*dt
@@ -1979,6 +1660,65 @@ subroutine dt_evolve_EB_1d_cmd
                           & + Jm_ms(3,ix_m,iy_m,iz_m) * coef2E
   end do
 !$omp end parallel do
+
+
+  if(flag_method_newton_Et) then
+     !Newton method for E(t)
+
+     E_m_new_tmp(:,:) = 0d0
+     do imacro = nmacro_s, nmacro_e
+        ix = macropoint(1,imacro)
+        iy = macropoint(2,imacro)
+        iz = macropoint(3,imacro)
+
+        g(2) = E_m_iter(2,imacro) - ( E_last(2,ix,iy,iz)            &
+                   - coef1E * (B_ms(3,ix,iy,iz)-B_ms(3,ix-1,iy,iz)) &
+                   + Jm_ms(2,ix,iy,iz) * coef2E )
+        g(3) = E_m_iter(3,imacro) - ( E_last(3,ix,iy,iz)            &
+                   + coef1E * (B_ms(2,ix,iy,iz)-B_ms(2,ix-1,iy,iz)) &
+                   + Jm_ms(3,ix,iy,iz) * coef2E )
+
+        vmr2Q = sum( vmr(2,:,imacro) * Qvec_bk(:,imacro) )
+        vmr3Q = sum( vmr(3,:,imacro) * Qvec_bk(:,imacro) )
+
+        dgdE(2,2) = sum( vpr(2,:,imacro) * vec2_tmp_m(:,imacro) ) + vmr2Q
+        dgdE(2,3) = sum( vpr(2,:,imacro) * vec3_tmp_m(:,imacro) ) + vmr2Q
+        dgdE(3,2) = sum( vpr(3,:,imacro) * vec2_tmp_m(:,imacro) ) + vmr3Q
+        dgdE(3,3) = sum( vpr(3,:,imacro) * vec3_tmp_m(:,imacro) ) + vmr3Q
+
+        dgdE(2,2) = 1d0 + coef2E * dgdE(2,2)/aLxyz
+        dgdE(2,3) =     + coef2E * dgdE(2,3)/aLxyz
+        dgdE(3,2) =     + coef2E * dgdE(3,2)/aLxyz
+        dgdE(3,3) = 1d0 + coef2E * dgdE(3,3)/aLxyz
+
+        !(inverse matrix)
+        det = dgdE(2,2)*dgdE(3,3) - dgdE(2,3)*dgdE(3,2)
+        inv_dgdE(2,2) =   dgdE(3,3) / det
+        inv_dgdE(3,3) =   dgdE(2,2) / det
+        inv_dgdE(2,3) = - dgdE(2,3) / det
+        inv_dgdE(3,2) = - dgdE(3,2) / det
+
+        dEn(2) = inv_dgdE(2,2) * g(2) + inv_dgdE(2,3) * g(3)
+        dEn(3) = inv_dgdE(3,2) * g(2) + inv_dgdE(3,3) * g(3)
+
+        !(new E field)
+        E_m_new_tmp(2,imacro) = E_m_iter(2,imacro) - dEn(2)
+        E_m_new_tmp(3,imacro) = E_m_iter(3,imacro) - dEn(3)
+
+     enddo
+
+     call comm_summation(E_m_new_tmp, E_m_iter, 3*nmacro, nproc_group_global)
+!$omp parallel do private(imacro,ix,iy,iz)
+     do imacro = 1,nmacro
+        ix = macropoint(1,imacro)
+        iy = macropoint(2,imacro)
+        iz = macropoint(3,imacro)
+        E_ms(:,ix,iy,iz) = E_m_iter(:,imacro)
+     enddo
+!$omp end parallel do
+
+  endif  !flag_method_newton_Et
+
 
   if(flag_use_absorb_bound) call apply_absorb_bound_1d_E
 
@@ -2162,7 +1902,7 @@ subroutine  add_light_source_1d_J(rlaser_int_wcm2, epdir_re, ae_shape, t_delay, 
   real(8) :: rlaser_int_wcm2, epdir_re(3), t_delay, pulse_tw, omega
   real(8) :: E0inc_abs, E0inc(3)
   real(8) :: time,t_s,t_e, env, func_inc, t_edge
-  real(8) :: omg_chirp, omg_min, omg_region
+  real(8) :: omg_chirp, omg_min,omg_max, omg_region
   character(*) :: ae_shape
 
   if(rlaser_int_wcm2.le.0d0) then
@@ -2233,6 +1973,25 @@ subroutine  add_light_source_1d_J(rlaser_int_wcm2, epdir_re, ae_shape, t_delay, 
      endif
      func_inc = env * cos(omg_chirp*((time-t_s-pulse_tw*0.5d0)))
 
+  else if(ae_shape=="CW_chirpB")then  !edge=100fs/chirp_range=2000cm
+
+     t_edge = 100d0 / au_time_fs
+     omg_chirp = 0d0
+     if(time.ge.t_s .and. time.le.t_e) then
+        omg_region = 2000d0   ![cm-1]
+        omg_region = omg_region * 1.239842428713634d-4 / 27.2114d0 ![cm-1]->[Hartree]
+        omg_min    = omega - 0.5d0 * omg_region
+        omg_chirp  = omg_min + (time - t_s)/pulse_tw * omg_region
+        if(time.ge.t_s .and. time.le.t_s + t_edge) then
+           env = sin((time-t_s)/(2d0*t_edge)*pi)**2
+        else if( time.ge.t_e - t_edge .and. time.le.t_e) then
+           env = sin((time-(t_e-2d0*t_edge))/(2d0*t_edge)*pi)**2
+        else
+           env = 1.0d0
+        endif
+     endif
+     func_inc = env * cos(omg_chirp*((time-t_s-pulse_tw*0.5d0)))
+
   else if(ae_shape=="Acos2_chirp")then  !chirp_range=1000cm
      omg_region = 1000d0   ![cm-1]
      omg_region = omg_region * 1.239842428713634d-4 / 27.2114d0 ![cm-1]->[Hartree]
@@ -2249,6 +2008,16 @@ subroutine  add_light_source_1d_J(rlaser_int_wcm2, epdir_re, ae_shape, t_delay, 
      if(time.ge.t_s .and. time.le.t_e) env = sin((time-t_s)/pulse_tw*pi)**2
      func_inc = env * cos(omg_chirp*((time-t_s-pulse_tw*0.5d0)))
 
+  else if(ae_shape=="Acos2_chirpB2")then  !chirp_range=2000cm (reverse)
+     omg_region = 2000d0   ![cm-1]
+     omg_region = omg_region * 1.239842428713634d-4 / 27.2114d0 ![cm-1]->[Hartree]
+    !omg_min    = omega - 0.5d0 * omg_region
+    !omg_chirp  = omg_min + (time - t_s)/pulse_tw * omg_region
+     omg_max    = omega + 0.5d0 * omg_region
+     omg_chirp  = omg_max - (time - t_s)/pulse_tw * omg_region
+     if(time.ge.t_s .and. time.le.t_e) env = sin((time-t_s)/pulse_tw*pi)**2
+     func_inc = env * cos(omg_chirp*((time-t_s-pulse_tw*0.5d0)))
+
   else if(ae_shape=="none")then
      func_inc = 0d0
   else
@@ -2260,24 +2029,7 @@ end subroutine
 
 subroutine  init_absorb_bound_1d_PML
   implicit none
-!  integer :: ix
   real(8) :: tmp_pi2dt, tmp_coef
-
-  if(.not. flag_use_E_B) then
-     if(.not.allocated(D1_pml)) then
-        allocate( D1_pml( 1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
-        allocate( D2_pml( 1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
-        D1_pml(:,:,:,:)=0d0
-        D2_pml(:,:,:,:)=0d0
-     endif
-     allocate( D1_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
-     allocate( D2_last(1:3,mx1_m:mx2_m,my1_m:my2_m,mz1_m:mz2_m) )
-     a_pml = 1d0  !parameter, now set to 1 according to the paper
-  endif
-
-  !nx_pml = 50 !
-  !M_pml  = 4  !2-4 usually
-  !R_pml  = 1d-6
 
   sgm_max_E_pml = - (log(R_pml)) *(M_pml+1)/(2d0 * HX_m*nx_pml * (4d0*pi/c_light) )
   sgm_max_B_pml = sgm_max_E_pml * (4*pi/c_light)**2
@@ -2292,11 +2044,6 @@ subroutine  init_absorb_bound_1d_PML
      if(comm_is_root(nproc_id_global)) write(*,*) "Error: coef is negative", real(tmp_coef)
      stop
   endif
-!  if(comm_is_root(nproc_id_global))then
-!    do ix = nx1_m, nx1_pml
-!       write(*,*) "#sgm:",ix,real(sgm_max_E_pml * (dble(nx1_pml-ix)/dble(nx_pml))**M_pml)
-!    enddo
-! endif
 
 end subroutine
 
@@ -2324,25 +2071,108 @@ subroutine apply_nose_hoover_thermostat_ms(imacro,Temp,dt_f)
   return
 end subroutine apply_nose_hoover_thermostat_ms
 
+subroutine calc_energy_joule_EB()
+  use Global_variables
+  implicit none
+  integer :: ix_m, iy_m, iz_m
+  real(8) :: elec_mid(3), jm_mid(3), ohm_mid
+  !$omp parallel do collapse(3) default(shared) private( &
+  !$omp     ix_m, iy_m, iz_m, elec_mid, jm_mid, ohm_mid &
+  !$omp     )
+  do iz_m = nz1_m, nz2_m
+  do iy_m = ny1_m, ny2_m
+  do ix_m = nx1_m, nx2_m
+     !use at t+dt/2
+     jm_mid   = Jm_ms(:,ix_m,iy_m,iz_m)
+     elec_mid = (E_ms(:,ix_m,iy_m,iz_m) + E_last(:,ix_m,iy_m,iz_m))*0.5d0
+     ohm_mid  = sum(-jm_mid * elec_mid)
+     energy_joule_ms(ix_m,iy_m,iz_m) = energy_joule_ms(ix_m,iy_m,iz_m) &
+                                     & + ohm_mid * aLxyz * dt 
+  end do
+  end do
+  end do
+  !$omp end parallel do
+  return
+end subroutine calc_energy_joule_EB
 
-subroutine calc_energy_joule_subtract_light_source()
+!===========================================================
+subroutine calc_energy_joule_subtract_light_source_EB()
   use Global_variables
   implicit none
   integer :: ix, iy, iz
-  real(8) :: elec_mid_old(3), jm_mid_old(3), ohm_mid_old
+  real(8) :: elec_mid(3), jm_mid(3), ohm_mid
 
   iy = ny_origin_m
   iz = nz_origin_m
   ix = ix_light_source
-
-  jm_mid_old   = (Jm_ms(:,ix,iy,iz) + Jm_old_ms(:,ix,iy,iz))*0.5d0
-  elec_mid_old = -(Ac_ms(:,ix,iy,iz) - Ac_old_ms(:,ix,iy,iz))/dt
-  ohm_mid_old  = sum(-jm_mid_old * elec_mid_old)
+  !use at t+dt/2
+  jm_mid   = Jm_ms(:,ix,iy,iz)   
+  elec_mid = ( E_ms(:,ix,iy,iz) + E_last(:,ix,iy,iz) )*0.5d0
+  ohm_mid  = sum(-jm_mid * elec_mid)
   energy_joule_ms(ix,iy,iz) = energy_joule_ms(ix,iy,iz) &
-                              - ohm_mid_old * aLxyz * dt  !subtract
+                              - ohm_mid * aLxyz * dt  !subtract
 
   return
-end subroutine calc_energy_joule_subtract_light_source
+end subroutine calc_energy_joule_subtract_light_source_EB
+
+!===========================================================
+subroutine calc_energy_elemag_EB()
+  use Global_variables
+  implicit none
+  integer :: ix_m, iy_m, iz_m
+  real(8) :: e2, b2, tmp
+
+  tmp = (1d0 / (8d0 * pi)) * aLxyz
+  !$omp parallel do collapse(3) default(shared) private(ix_m,iy_m,iz_m,e2,b2)
+  do iz_m = nz1_m, nz2_m
+  do iy_m = ny1_m, ny2_m
+  do ix_m = nx1_m, nx2_m
+    !e2 = sum(E_ms(:,ix_m,iy_m,iz_m)**2)
+     e2 = sum(((E_ms(:,ix_m,iy_m,iz_m)+E_last(:,ix_m,iy_m,iz_m))*0.5d0)**2)
+     b2 = sum(B_ms(:,ix_m,iy_m,iz_m)**2)
+     energy_elemag_ms(ix_m,iy_m,iz_m) = tmp * (e2 + b2)
+  end do
+  end do
+  end do
+  !$omp end parallel do
+  return
+end subroutine calc_energy_elemag_EB
+!===========================================================
+subroutine calc_total_energy_EB()
+  use Global_variables
+  implicit none
+  integer :: ix_m, iy_m, iz_m
+  real(8) :: e_em, e_ej, e_ex
+  real(8) :: cell_scalling 
+  
+  e_em=0d0
+  e_ej=0d0
+  e_ex=0d0
+  cell_scalling = HX_m / aLx   !for 1D
+  
+!$omp parallel do collapse(3) default(shared) private(ix_m,iy_m,iz_m) reduction(+: e_em,e_ej,e_ex)
+  do iz_m = nz1_m, nz2_m
+  do iy_m = ny1_m, ny2_m
+  do ix_m = nx1_m, nx2_m
+     e_em = e_em + energy_elemag_ms(ix_m,iy_m,iz_m) * cell_scalling
+     e_ej = e_ej + energy_joule_ms(ix_m,iy_m,iz_m)  * cell_scalling
+     e_ex = e_ex + energy_elec_ms(ix_m,iy_m,iz_m)   * cell_scalling
+  end do
+  end do
+  end do
+!$end omp parallel do
+  total_energy_elemag_old = total_energy_elemag
+  total_energy_absorb_old = total_energy_absorb
+  total_energy_em_old = total_energy_em
+  total_energy_elec_old = total_energy_elec
+  total_energy_elemag = e_em
+  total_energy_absorb = e_ej
+  total_energy_em = e_em + e_ej
+  total_energy_elec = e_ex
+  return
+end subroutine calc_total_energy_EB
+
+!===========================================================
 
 subroutine read_ini_coor_vel_ms_cmd
   use salmon_global

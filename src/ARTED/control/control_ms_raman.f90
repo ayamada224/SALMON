@@ -1000,17 +1000,17 @@ contains
       !! TODO: Support the automatic unit-system conversion of _ac.data files
 
       do iiz_m = nz1_m, nz2_m
-        do iiy_m = ny1_m, ny2_m
-          do iix_m = nx1_m, nx2_m
-            write(fh_ac,'(I6,1X,I6,1X,I6,99(1X,E23.15E3))',advance='no')  &
+      do iiy_m = ny1_m, ny2_m
+      do iix_m = nx1_m, nx2_m
+         write(fh_ac,'(I6,1X,I6,1X,I6,99(1X,E23.15E3))',advance='no')  &
               & iix_m, iiy_m, iiz_m, &
               & data_out(1:ndata_out_column, iix_m, iiy_m, iiz_m, ipos)
-           !if(use_ehrenfest_md=='y') then
-           !    !Add Jm_ion_xyz and Temperature_ion for MD (Later)
-           !endif
-            write(fh_ac,*)
-          end do
-        end do
+        !if(use_ehrenfest_md=='y') then
+        !    !Add Jm_ion_xyz and Temperature_ion for MD (Later)
+        !endif
+         write(fh_ac,*)
+      end do
+      end do
       end do
       close(fh_ac)
     end if

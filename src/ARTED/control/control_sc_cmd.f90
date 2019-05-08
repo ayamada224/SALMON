@@ -217,7 +217,7 @@ contains
     endif
     
     !Initial Step Procedure
-    call cal_force_energy_CRK
+    call cal_force_energy_CRK(0)
     SearchDirection(:,:) = force(:,:)
     do ia=1,NI
        if(flag_geo_opt_atom(ia)=='n') SearchDirection(:,ia)=0d0  !fix atom
@@ -274,7 +274,7 @@ contains
        do
           Rion(:,:)   = Rion_save(:,:) + StepLen_line(i)* SearchDirection(:,:)
           Rion_eq(:,:)= Rion(:,:)
-          call cal_force_energy_CRK
+          call cal_force_energy_CRK(0)
           call variable_3xNto3N(NI,force,force_1d)
           call cal_inner_product(3*NI,force_1d,SearchDirection_1d,F_line)
           F_line_2pt(i) = F_line
@@ -307,7 +307,7 @@ contains
        Rion(:,:)   = Rion_save(:,:) + StepLen_line(i)* SearchDirection(:,:)
        Rion_eq(:,:)= Rion(:,:)
        dRion_rmsd  = StepLen_line(i)*sqrt(sum(SearchDirection_1d(:)**2)/NI)
-       call cal_force_energy_CRK
+       call cal_force_energy_CRK(0)
        call variable_3xNto3N(NI,force,force_1d)
        call cal_inner_product(3*NI,force_1d,SearchDirection_1d,F_line)
        F_line_2pt(i) = F_line
@@ -346,7 +346,7 @@ contains
           Rion_eq(:,:)= Rion(:,:)
           write(comment_line,110) iter_perp, iter_line
           call write_xyz(comment_line,"add","r  ")
-          call cal_force_energy_CRK
+          call cal_force_energy_CRK(0)
           call variable_3xNto3N(NI,force,force_1d)
           call cal_inner_product(3*NI,force_1d,SearchDirection_1d,F_line)
           F_line_new = F_line
@@ -372,7 +372,7 @@ contains
           dRion_rmsd  = StepLen_line_zero*sqrt(sum(SearchDirection_1d(:)**2)/NI)
           write(comment_line,110) iter_perp, iter_line
           call write_xyz(comment_line,"add","r  ")
-          call cal_force_energy_CRK
+          call cal_force_energy_CRK(0)
           call variable_3xNto3N(NI,force,force_1d)
           call cal_inner_product(3*NI,force_1d,SearchDirection_1d,F_line)
           F_line_zero = F_line
@@ -414,7 +414,7 @@ contains
        enddo
 
        !Force calculation
-       call cal_force_energy_CRK
+       call cal_force_energy_CRK(0)
        call variable_3xNto3N(NI,force,force_1d)
        call cal_mean_max_forces(NI,force,fave,fmax)
 
@@ -500,7 +500,7 @@ contains
     zero     = 0d0
     zero3(:) = 0d0
 
-    call cal_force_energy_CRK
+    call cal_force_energy_CRK(0)
     call cal_mean_max_forces(NI,force,fave,fmax)
     opt_direction(:,:) = force(:,:)/fave
 
@@ -526,7 +526,7 @@ contains
           Rion(:,ia) = Rion(:,ia) + opt_direction(:,ia)*step_size
        enddo
 
-       call cal_force_energy_CRK
+       call cal_force_energy_CRK(0)
        call cal_mean_max_forces(NI,force,fave,fmax)
        opt_direction(:,:) = force(:,:)/fave
 
@@ -590,7 +590,7 @@ contains
 
     ! Export to file_trj (initial step)
     if (out_rvf_rt=='y')then
-       call cal_force_energy_CRK
+       call cal_force_energy_CRK(0)
        write(comment_line,110) -1, 0.0d0
        if(ensemble=="NVT" .and. thermostat=="nose-hoover") &
        &  write(comment_line,112) trim(comment_line), xi_nh
@@ -627,7 +627,7 @@ contains
        Eem   = Vuc * sum(Et(:)**2)/(8d0*pi)
 
        if(flag_fix_atoms_md) then
-          call cal_force_energy_CRK
+          call cal_force_energy_CRK(0)
           Tene=0d0
           goto 100
        endif
@@ -667,7 +667,7 @@ contains
 
        !update force (electric state) with updated coordinate
        aforce(:,:) = force(:,:)
-       call cal_force_energy_CRK
+       call cal_force_energy_CRK(0)
        aforce(:,:) = 0.5d0*( aforce(:,:) + force(:,:) )
 
        do ia=1,NI
